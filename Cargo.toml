@@ -42,14 +42,15 @@ rust-version = "1.87"
 anyhow = "1.0.72"
 apache-avro = { version = "0.20", features = ["zstandard"] }
 array-init = "2"
-arrow-arith = { version = "=56.1.0" }
-arrow-array = { version = "=56.1.0" }
-arrow-buffer = { version = "=56.1.0" }
-arrow-cast = { version = "=56.1.0" }
-arrow-ord = { version = "=56.1.0" }
-arrow-schema = { version = "=56.1.0" }
-arrow-select = { version = "=56.1.0" }
-arrow-string = { version = "=56.1.0" }
+# Align arrow version with the one used by datafusion 50.0.0
+arrow-arith = { version = "56.1.0" }
+arrow-array = { version = "56.1.0" }
+arrow-buffer = { version = "56.1.0" }
+arrow-cast = { version = "56.1.0" }
+arrow-ord = { version = "56.1.0" }
+arrow-schema = { version = "56.1.0" }
+arrow-select = { version = "56.1.0" }
+arrow-string = { version = "56.1.0" }
 as-any = "0.3.2"
 async-trait = "0.1.89"
 aws-config = "1.8.1"
@@ -62,9 +63,10 @@ bytes = "1.10"
 chrono = "0.4.41"
 clap = { version = "4.5.41", features = ["derive", "cargo"] }
 ctor = "0.2.8"
-datafusion = "=50.0.0"
-datafusion-cli = "=50.0.0"
-datafusion-sqllogictest = "=50.0.0"
+# Use datafusion fork to make sure to reuse the same versions of other packages and to avoid build conflicts caused by lzma
+datafusion = { git = "https://github.com/DataDog/datafusion", rev = "f209f98479cc6ba19c67fcbb0d69c441ef46ed3e", package = "datafusion" }
+datafusion-cli = { git = "https://github.com/DataDog/datafusion", rev = "f209f98479cc6ba19c67fcbb0d69c441ef46ed3e", package = "datafusion-cli" }
+datafusion-sqllogictest = { git = "https://github.com/DataDog/datafusion", rev = "f209f98479cc6ba19c67fcbb0d69c441ef46ed3e", package = "datafusion-sqllogictest" }
 derive_builder = "0.20"
 dirs = "6"
 enum-ordinalize = "4.3.0"
@@ -94,7 +96,8 @@ num-bigint = "0.4.6"
 once_cell = "1.20"
 opendal = "0.54.0"
 ordered-float = "4"
-parquet = "=56.1.0"
+# Align parquet version with the one used by datafusion 50.0.0
+parquet = "56.1.0"
 pilota = "0.11.10"
 port_scanner = "0.1.5"
 pretty_assertions = "1.4"
