@@ -40,7 +40,8 @@ rust-version = "1.87"
 
 [workspace.dependencies]
 anyhow = "1.0.72"
-apache-avro = { version = "0.20", features = ["zstandard"] }
+# Update to match our fork's version
+apache-avro = { version = "0.21", features = ["zstandard"] }
 array-init = "2"
 # Align arrow version with the one used by datafusion 50.0.0
 arrow-arith = { version = "56.1.0" }
@@ -64,9 +65,9 @@ chrono = "0.4.41"
 clap = { version = "4.5.41", features = ["derive", "cargo"] }
 ctor = "0.2.8"
 # Use datafusion fork to make sure to reuse the same versions of other packages and to avoid build conflicts caused by lzma
-datafusion = { git = "https://github.com/DataDog/datafusion", rev = "f209f98479cc6ba19c67fcbb0d69c441ef46ed3e", package = "datafusion" }
-datafusion-cli = { git = "https://github.com/DataDog/datafusion", rev = "f209f98479cc6ba19c67fcbb0d69c441ef46ed3e", package = "datafusion-cli" }
-datafusion-sqllogictest = { git = "https://github.com/DataDog/datafusion", rev = "f209f98479cc6ba19c67fcbb0d69c441ef46ed3e", package = "datafusion-sqllogictest" }
+datafusion = { git = "https://github.com/DataDog/datafusion", rev = "34c8e49a36343092fc2a1dce2ceb503c2b5dfd3d", package = "datafusion" }
+datafusion-cli = { git = "https://github.com/DataDog/datafusion", rev = "34c8e49a36343092fc2a1dce2ceb503c2b5dfd3d", package = "datafusion-cli" }
+datafusion-sqllogictest = { git = "https://github.com/DataDog/datafusion", rev = "34c8e49a36343092fc2a1dce2ceb503c2b5dfd3d", package = "datafusion-sqllogictest" }
 derive_builder = "0.20"
 dirs = "6"
 enum-ordinalize = "4.3.0"
