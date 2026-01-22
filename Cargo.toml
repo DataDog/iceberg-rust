@@ -62,9 +62,9 @@ bytes = "1.10"
 chrono = "0.4.41"
 clap = { version = "4.5.48", features = ["derive", "cargo"] }
 ctor = "0.2.8"
-datafusion = { git = "https://github.com/apache/datafusion", branch = "branch-52" }
-datafusion-cli = { git = "https://github.com/apache/datafusion", branch = "branch-52" }
-datafusion-sqllogictest = { git = "https://github.com/apache/datafusion", branch = "branch-52" }
+datafusion = { version = "52" }
+datafusion-cli = { version = "52" }
+datafusion-sqllogictest = { version = "52" }
 derive_builder = "0.20"
 dirs = "6"
 enum-ordinalize = "4.3.0"
