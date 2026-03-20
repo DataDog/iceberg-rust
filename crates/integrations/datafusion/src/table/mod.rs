@@ -26,6 +26,7 @@
 //!   table snapshot. Use for consistent analytical queries or time-travel scenarios.
 
 pub mod metadata_table;
+pub mod partitioned;
 pub mod table_provider_factory;
 
 use std::any::Any;
