@@ -45,7 +45,6 @@ impl IcebergPartitionedTableProvider {
         &self,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
-        limit: Option<usize>,
     ) -> DFResult<IcebergPartitionedScan> {
         let table = self
             .catalog
@@ -90,12 +89,7 @@ impl IcebergPartitionedTableProvider {
 
         let file_io = table.file_io().clone();
 
-        Ok(IcebergPartitionedScan::new(
-            tasks,
-            file_io,
-            output_schema,
-            limit,
-        ))
+        Ok(IcebergPartitionedScan::new(tasks, file_io, output_schema))
     }
 }
 
@@ -120,8 +114,13 @@ impl TableProvider for IcebergPartitionedTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if limit.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "IcebergPartitionedTableProvider does not support limit pushdown".to_string(),
+            ));
+        }
         let scan = self
-            .scan_without_session(projection.cloned(), filters.to_vec(), limit)
+            .scan_without_session(projection.cloned(), filters.to_vec())
             .await?;
         Ok(Arc::new(scan))
     }
