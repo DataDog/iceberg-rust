@@ -10,24 +10,32 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowReaderBuilder;
-use iceberg::io::FileIO;
+use iceberg::io::{FileIOBuilder, StorageConfig, StorageFactory};
 use iceberg::scan::FileScanTask;
 
 use crate::to_datafusion_error;
+
 #[derive(Debug)]
 pub struct IcebergPartitionedScan {
     tasks: Vec<FileScanTask>,
-    file_io: FileIO,
+    storage_factory: Arc<dyn StorageFactory>,
+    storage_config: StorageConfig,
     plan_properties: PlanProperties,
 }
 
 impl IcebergPartitionedScan {
-    pub fn new(tasks: Vec<FileScanTask>, file_io: FileIO, schema: ArrowSchemaRef) -> Self {
+    pub fn new(
+        tasks: Vec<FileScanTask>,
+        storage_factory: Arc<dyn StorageFactory>,
+        storage_config: StorageConfig,
+        schema: ArrowSchemaRef,
+    ) -> Self {
         let n_partitions = tasks.len();
         let plan_properties = Self::compute_properties(schema, n_partitions);
         Self {
             tasks,
-            file_io,
+            storage_factory,
+            storage_config,
             plan_properties,
         }
     }
@@ -36,8 +44,8 @@ impl IcebergPartitionedScan {
         &self.tasks
     }
 
-    pub fn file_io(&self) -> &FileIO {
-        &self.file_io
+    pub fn storage_factory(&self) -> &Arc<dyn StorageFactory> {
+        &self.storage_factory
     }
 
     fn compute_properties(schema: ArrowSchemaRef, n_partitions: usize) -> PlanProperties {
@@ -87,7 +95,9 @@ impl ExecutionPlan for IcebergPartitionedScan {
             ))
         })?;
 
-        let file_io = self.file_io.clone();
+        let file_io = FileIOBuilder::new(self.storage_factory.clone())
+            .with_props(self.storage_config.props().clone())
+            .build();
 
         let fut = async move {
             let task_stream = futures::stream::once(futures::future::ready(Ok(task)));
