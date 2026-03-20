@@ -24,6 +24,7 @@ pub use error::*;
 pub mod physical_plan;
 mod schema;
 pub mod table;
+pub use physical_plan::IcebergPartitionedScan;
 pub use table::table_provider_factory::IcebergTableProviderFactory;
 pub use table::*;
 
