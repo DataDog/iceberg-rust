@@ -42,7 +42,7 @@ impl IcebergPartitionedTableProvider {
         })
     }
 
-    pub async fn scan_without_session(
+    async fn scan_without_session(
         &self,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
@@ -92,7 +92,11 @@ impl IcebergPartitionedTableProvider {
             })?),
         };
 
-        Ok(IcebergPartitionedScan::new(tasks, table.file_io().clone(), output_schema))
+        Ok(IcebergPartitionedScan::new(
+            tasks,
+            table.file_io().clone(),
+            output_schema,
+        ))
     }
 }
 
