@@ -11,7 +11,6 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::io::StorageFactory;
 use iceberg::scan::FileScanTask;
 use iceberg::{Catalog, NamespaceIdent, Result, TableIdent};
 
@@ -24,7 +23,6 @@ pub struct IcebergPartitionedTableProvider {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     schema: ArrowSchemaRef,
-    storage_factory: Arc<dyn StorageFactory>,
 }
 
 impl IcebergPartitionedTableProvider {
@@ -32,7 +30,6 @@ impl IcebergPartitionedTableProvider {
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
-        storage_factory: Arc<dyn StorageFactory>,
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
         let table = catalog.load_table(&table_ident).await?;
@@ -41,7 +38,6 @@ impl IcebergPartitionedTableProvider {
             catalog,
             table_ident,
             schema,
-            storage_factory,
         })
     }
 
@@ -91,14 +87,7 @@ impl IcebergPartitionedTableProvider {
             })?),
         };
 
-        let storage_config = table.file_io().config().clone();
-
-        Ok(IcebergPartitionedScan::new(
-            tasks,
-            self.storage_factory.clone(),
-            storage_config,
-            output_schema,
-        ))
+        Ok(IcebergPartitionedScan::new(tasks, table, output_schema))
     }
 }
 
