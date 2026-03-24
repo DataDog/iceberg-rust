@@ -31,6 +31,8 @@ impl IcebergPartitionedTableProvider {
         name: impl Into<String>,
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
+        // First load: used only to snapshot the Arrow schema for DataFusion planning.
+        // A second load_table is issued at scan time to guarantee the freshest snapshot.
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
         Ok(Self {
@@ -45,12 +47,16 @@ impl IcebergPartitionedTableProvider {
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
     ) -> DFResult<IcebergPartitionedScan> {
+        // Second load: fetch the latest snapshot so scans always reflect current table state.
         let table = self
             .catalog
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
 
+        // TODO: schema staleness risk, projection indices are resolved against self.schema,
+        // which was captured at try_new time. If the table schema evolved between try_new and
+        // this scan, the column names may be incorrect. This logic is inherited from IcebergTableProvider.
         let col_names = projection.as_ref().map(|indices| {
             indices
                 .iter()
