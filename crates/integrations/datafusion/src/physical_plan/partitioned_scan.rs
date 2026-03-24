@@ -122,16 +122,6 @@ impl DisplayAs for IcebergPartitionedScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        let files = if self.tasks.len() <= 5 {
-            self.tasks
-                .iter()
-                .map(|t| t.data_file_path())
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            format!("({} files)", self.tasks.len())
-        };
-
         let projection = self
             .schema()
             .fields()
@@ -147,7 +137,17 @@ impl DisplayAs for IcebergPartitionedScan {
         let file_count = self.tasks.len();
         write!(
             f,
-            "IcebergPartitionedScan projection=[{projection}] predicate=[{predicate}] file_count=[{file_count}] files=[{files}]"
-        )
+            "IcebergPartitionedScan projection=[{projection}] predicate=[{predicate}] file_count=[{file_count}]"
+        )?;
+        if self.tasks.len() <= 5 {
+            let files = self
+                .tasks
+                .iter()
+                .map(|t| t.data_file_path())
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, " files=[{files}]")?;
+        }
+        Ok(())
     }
 }
