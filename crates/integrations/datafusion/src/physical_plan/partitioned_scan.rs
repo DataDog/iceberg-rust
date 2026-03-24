@@ -15,7 +15,7 @@ use iceberg::scan::FileScanTask;
 
 use crate::to_datafusion_error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IcebergPartitionedScan {
     tasks: Vec<FileScanTask>,
     file_io: FileIO,
@@ -33,7 +33,7 @@ impl IcebergPartitionedScan {
         }
     }
 
-    pub fn scan_tasks(&self) -> &[FileScanTask] {
+    pub fn tasks(&self) -> &[FileScanTask] {
         &self.tasks
     }
 
@@ -122,20 +122,21 @@ impl DisplayAs for IcebergPartitionedScan {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Projection and predicate are read directly from the first task rather than
-        // stored as struct fields. This keeps the node self-contained: all display
-        // information is derived from the already-serializable `FileScanTask`s,
-        // which simplifies the DataFusion distributed codec, adding dedicated fields
-        // would require encoding them separately in the protobuf round-trip.
-        let first = self.tasks.first();
-        let projection = first.map_or(String::new(), |t| {
-            t.project_field_ids()
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        });
-        let predicate = first
+        // Projection and predicate are derived from the output schema and the first task
+        // rather than stored as dedicated struct fields. This keeps the node self-contained:
+        // all display information is derived from the already-serializable `FileScanTask`s
+        // and the output schema, which simplifies the DataFusion distributed codec, adding
+        // dedicated fields would require encoding them separately in the protobuf round-trip.
+        let projection = self
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let predicate = self
+            .tasks
+            .first()
             .and_then(|t| t.predicate())
             .map_or(String::new(), |p| format!("{p}"));
         let file_count = self.tasks.len();

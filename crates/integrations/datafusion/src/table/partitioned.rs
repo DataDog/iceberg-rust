@@ -11,7 +11,6 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::scan::FileScanTask;
 use iceberg::{Catalog, NamespaceIdent, Result, TableIdent};
 
 use crate::error::to_datafusion_error;
@@ -70,13 +69,13 @@ impl IcebergPartitionedTableProvider {
             builder = builder.with_filter(pred);
         }
 
-        let tasks: Vec<FileScanTask> = builder
+        let tasks = builder
             .build()
             .map_err(to_datafusion_error)?
             .plan_files()
             .await
             .map_err(to_datafusion_error)?
-            .try_collect()
+            .try_collect::<Vec<_>>()
             .await
             .map_err(to_datafusion_error)?;
 
@@ -257,7 +256,7 @@ mod tests {
             .unwrap();
         let scan = provider.scan_without_session(None, vec![]).await.unwrap();
 
-        assert_eq!(scan.scan_tasks().len(), 3);
+        assert_eq!(scan.tasks().len(), 3);
         assert_eq!(scan.properties().partitioning.partition_count(), 3);
     }
 }
