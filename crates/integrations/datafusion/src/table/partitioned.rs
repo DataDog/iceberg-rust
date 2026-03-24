@@ -247,6 +247,21 @@ mod tests {
             .unwrap();
     }
 
+    /// An empty table must produce a zero-partition scan so DataFusion never calls
+    /// execute(0), which would otherwise return an out-of-bounds error.
+    #[tokio::test]
+    async fn test_empty_table_zero_partitions() {
+        let (catalog, namespace, table_name, _temp_dir) = make_catalog_and_table().await;
+        // no files appended
+        let provider = IcebergPartitionedTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let scan = provider.scan_without_session(None, vec![]).await.unwrap();
+
+        assert_eq!(scan.tasks().len(), 0);
+        assert_eq!(scan.properties().partitioning.partition_count(), 0);
+    }
+
     /// Each data file in the table must become exactly one DataFusion partition
     /// in IcebergPartitionedScan, enabling parallel file reads.
     #[tokio::test]
