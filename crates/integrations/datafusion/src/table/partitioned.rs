@@ -143,3 +143,121 @@ impl TableProvider for IcebergPartitionedTableProvider {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema, Type,
+    };
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    async fn make_catalog_and_table() -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse = temp_dir.path().to_str().unwrap().to_string();
+
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace = NamespaceIdent::new("ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .location(format!("{warehouse}/t"))
+                    .schema(schema)
+                    .properties(HashMap::new())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        (catalog, namespace, "t".to_string(), temp_dir)
+    }
+
+    /// Registers `n` synthetic data files in the table metadata via the iceberg
+    /// transaction API. No actual parquet files are written, only the metadata
+    /// entries that `plan_files()` reads are created.
+    async fn append_fake_data_files(
+        catalog: &Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        table_name: &str,
+        n: usize,
+    ) {
+        let table = catalog
+            .load_table(&TableIdent::new(namespace.clone(), table_name.to_string()))
+            .await
+            .unwrap();
+
+        let data_files = (0..n)
+            .map(|i| {
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(format!(
+                        "{}/data/fake_{i}.parquet",
+                        table.metadata().location()
+                    ))
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(128)
+                    .record_count(1)
+                    .partition_spec_id(table.metadata().default_partition_spec_id())
+                    .build()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(data_files);
+        action
+            .apply(tx)
+            .unwrap()
+            .commit(catalog.as_ref())
+            .await
+            .unwrap();
+    }
+
+    /// Each data file in the table must become exactly one DataFusion partition
+    /// in IcebergPartitionedScan, enabling parallel file reads.
+    #[tokio::test]
+    async fn test_one_partition_per_file() {
+        let (catalog, namespace, table_name, _temp_dir) = make_catalog_and_table().await;
+        append_fake_data_files(&catalog, &namespace, &table_name, 3).await;
+
+        let provider = IcebergPartitionedTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let scan = provider.scan_without_session(None, vec![]).await.unwrap();
+
+        assert_eq!(scan.scan_tasks().len(), 3);
+        assert_eq!(scan.properties().partitioning.partition_count(), 3);
+    }
+}
