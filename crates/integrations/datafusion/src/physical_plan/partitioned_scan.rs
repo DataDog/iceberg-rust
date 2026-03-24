@@ -115,10 +115,12 @@ impl DisplayAs for IcebergPartitionedScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(
-            f,
-            "IcebergPartitionedScan partitions:[{}]",
-            self.tasks.len()
-        )
+        let files = self
+            .tasks
+            .iter()
+            .map(|t| t.data_file_path())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "IcebergPartitionedScan files:[{files}]")
     }
 }
