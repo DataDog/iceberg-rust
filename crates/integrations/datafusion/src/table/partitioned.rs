@@ -87,7 +87,7 @@ impl IcebergPartitionedTableProvider {
             })?),
         };
 
-        Ok(IcebergPartitionedScan::new(tasks, table, output_schema))
+        Ok(IcebergPartitionedScan::new(tasks, table.file_io().clone(), output_schema))
     }
 }
 
