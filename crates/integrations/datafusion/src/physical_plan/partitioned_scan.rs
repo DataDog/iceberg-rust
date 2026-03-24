@@ -15,6 +15,13 @@ use iceberg::scan::FileScanTask;
 
 use crate::to_datafusion_error;
 
+/// A DataFusion [`ExecutionPlan`] that reads one [`FileScanTask`] per partition.
+///
+/// Display information (projection, predicate) is derived at runtime from the output schema and
+/// the tasks rather than stored as dedicated struct fields. This keeps the node self-contained:
+/// all state is already serializable via `FileScanTask`, which simplifies the DataFusion
+/// distributed codec, adding dedicated fields would require encoding them separately in the
+/// protobuf round-trip.
 #[derive(Debug, Clone)]
 pub struct IcebergPartitionedScan {
     tasks: Vec<FileScanTask>,
@@ -125,11 +132,6 @@ impl DisplayAs for IcebergPartitionedScan {
             format!("({} files)", self.tasks.len())
         };
 
-        // Projection and predicate are derived from the output schema and the first task
-        // rather than stored as dedicated struct fields. This keeps the node self-contained:
-        // all display information is derived from the already-serializable `FileScanTask`s
-        // and the output schema, which simplifies the DataFusion distributed codec, adding
-        // dedicated fields would require encoding them separately in the protobuf round-trip.
         let projection = self
             .schema()
             .fields()
