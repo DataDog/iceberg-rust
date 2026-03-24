@@ -115,12 +115,15 @@ impl DisplayAs for IcebergPartitionedScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        let files = self
-            .tasks
-            .iter()
-            .map(|t| t.data_file_path())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let files = if self.tasks.len() <= 5 {
+            self.tasks
+                .iter()
+                .map(|t| t.data_file_path())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!("({} files)", self.tasks.len())
+        };
 
         // Projection and predicate are derived from the output schema and the first task
         // rather than stored as dedicated struct fields. This keeps the node self-contained:
