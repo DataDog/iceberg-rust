@@ -111,11 +111,8 @@ impl TableProvider for IcebergPartitionedTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if limit.is_some() {
-            return Err(DataFusionError::NotImplemented(
-                "IcebergPartitionedTableProvider does not support limit pushdown".to_string(),
-            ));
-        }
+        // limit is a hint only; DataFusion inserts a GlobalLimitExec above us anyway
+        let _ = limit;
         let scan = self
             .scan_without_session(projection.cloned(), filters.to_vec())
             .await?;
