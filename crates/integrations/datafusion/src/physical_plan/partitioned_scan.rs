@@ -23,7 +23,7 @@ pub struct IcebergPartitionedScan {
 }
 
 impl IcebergPartitionedScan {
-    pub(crate) fn new(tasks: Vec<FileScanTask>, file_io: FileIO, schema: ArrowSchemaRef) -> Self {
+    pub fn new(tasks: Vec<FileScanTask>, file_io: FileIO, schema: ArrowSchemaRef) -> Self {
         let n_partitions = tasks.len();
         let plan_properties = Self::compute_properties(schema, n_partitions);
         Self {
@@ -35,6 +35,10 @@ impl IcebergPartitionedScan {
 
     pub fn scan_tasks(&self) -> &[FileScanTask] {
         &self.tasks
+    }
+
+    pub fn file_io(&self) -> &FileIO {
+        &self.file_io
     }
 
     fn compute_properties(schema: ArrowSchemaRef, n_partitions: usize) -> PlanProperties {
@@ -111,6 +115,10 @@ impl DisplayAs for IcebergPartitionedScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "IcebergPartitionedScan partitions:[{}]", self.tasks.len())
+        write!(
+            f,
+            "IcebergPartitionedScan partitions:[{}]",
+            self.tasks.len()
+        )
     }
 }
