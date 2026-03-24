@@ -121,6 +121,27 @@ impl DisplayAs for IcebergPartitionedScan {
             .map(|t| t.data_file_path())
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "IcebergPartitionedScan files:[{files}]")
+
+        // Projection and predicate are read directly from the first task rather than
+        // stored as struct fields. This keeps the node self-contained: all display
+        // information is derived from the already-serializable `FileScanTask`s,
+        // which simplifies the DataFusion distributed codec, adding dedicated fields
+        // would require encoding them separately in the protobuf round-trip.
+        let first = self.tasks.first();
+        let projection = first.map_or(String::new(), |t| {
+            t.project_field_ids()
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        let predicate = first
+            .and_then(|t| t.predicate())
+            .map_or(String::new(), |p| format!("{p}"));
+        let file_count = self.tasks.len();
+        write!(
+            f,
+            "IcebergPartitionedScan projection=[{projection}] predicate=[{predicate}] file_count=[{file_count}] files=[{files}]"
+        )
     }
 }
