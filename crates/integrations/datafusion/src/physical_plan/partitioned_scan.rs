@@ -44,7 +44,7 @@ impl IcebergPartitionedScan {
     fn compute_properties(schema: ArrowSchemaRef, n_partitions: usize) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(n_partitions.max(1)),
+            Partitioning::UnknownPartitioning(n_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
