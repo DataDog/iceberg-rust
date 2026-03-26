@@ -140,7 +140,8 @@ impl DisplayAs for IcebergPartitionedScan {
         let file_count = self.tasks.len();
         write!(
             f,
-            "IcebergPartitionedScan projection:[{projection}] predicate:[{predicate}] file_count:[{file_count}]"
+            "{} projection:[{projection}] predicate:[{predicate}] file_count:[{file_count}]",
+            self.name()
         )?;
         if self.tasks.len() <= 5 {
             let files = self
