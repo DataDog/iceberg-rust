@@ -72,9 +72,8 @@ impl TableProvider for IcebergPartitionedTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        // TODO: schema staleness risk, projection indices are resolved against self.schema,
-        // which was captured at try_new time. If the table schema evolved between try_new and
-        // this scan, the column names may be incorrect. This logic is inherited from IcebergTableProvider.
+        // Projection indices are resolved against self.schema (captured at try_new time),
+        // same as IcebergTableProvider / IcebergTableScan.
         let col_names = projection.map(|indices| {
             indices
                 .iter()
