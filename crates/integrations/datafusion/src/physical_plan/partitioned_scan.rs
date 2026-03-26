@@ -89,8 +89,9 @@ impl ExecutionPlan for IcebergPartitionedScan {
     ) -> DFResult<SendableRecordBatchStream> {
         let task = self.tasks.get(partition).cloned().ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(format!(
-                "IcebergPartitionedScan: partition index {partition} is out of bounds \
+                "{}: partition index {partition} is out of bounds \
                  (total tasks: {})",
+                self.name(),
                 self.tasks.len()
             ))
         })?;
