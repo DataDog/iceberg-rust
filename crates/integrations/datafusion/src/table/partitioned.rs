@@ -11,7 +11,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::{Catalog, NamespaceIdent, Result, TableIdent};
+use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
@@ -142,11 +142,11 @@ impl TableProvider for IcebergPartitionedTableProvider {
         _input: Arc<dyn ExecutionPlan>,
         _insert_op: datafusion::logical_expr::dml::InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::NotImplemented(
+        Err(to_datafusion_error(Error::new(
+            ErrorKind::FeatureUnsupported,
             "IcebergPartitionedTableProvider does not support writes; \
-             use IcebergTableProvider instead"
-                .to_string(),
-        ))
+             use IcebergTableProvider instead",
+        )))
     }
 }
 

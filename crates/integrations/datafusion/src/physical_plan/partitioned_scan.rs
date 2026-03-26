@@ -129,6 +129,8 @@ impl DisplayAs for IcebergPartitionedScan {
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>()
             .join(",");
+        // All tasks share the same predicate (they come from a single scan plan build),
+        // so reading it from the first task is sufficient.
         let predicate = self
             .tasks
             .first()
@@ -137,7 +139,7 @@ impl DisplayAs for IcebergPartitionedScan {
         let file_count = self.tasks.len();
         write!(
             f,
-            "IcebergPartitionedScan projection=[{projection}] predicate=[{predicate}] file_count=[{file_count}]"
+            "IcebergPartitionedScan projection:[{projection}] predicate:[{predicate}] file_count:[{file_count}]"
         )?;
         if self.tasks.len() <= 5 {
             let files = self
@@ -146,7 +148,7 @@ impl DisplayAs for IcebergPartitionedScan {
                 .map(|t| t.data_file_path())
                 .collect::<Vec<_>>()
                 .join(", ");
-            write!(f, " files=[{files}]")?;
+            write!(f, " files:[{files}]")?;
         }
         Ok(())
     }
