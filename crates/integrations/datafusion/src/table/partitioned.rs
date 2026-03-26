@@ -42,62 +42,6 @@ impl IcebergPartitionedTableProvider {
         })
     }
 
-    async fn scan_without_session(
-        &self,
-        projection: Option<Vec<usize>>,
-        filters: Vec<Expr>,
-    ) -> DFResult<IcebergPartitionedScan> {
-        // Second load: fetch the latest snapshot so scans always reflect current table state.
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
-
-        // TODO: schema staleness risk, projection indices are resolved against self.schema,
-        // which was captured at try_new time. If the table schema evolved between try_new and
-        // this scan, the column names may be incorrect. This logic is inherited from IcebergTableProvider.
-        let col_names = projection.as_ref().map(|indices| {
-            indices
-                .iter()
-                .map(|&i| self.schema.field(i).name().clone())
-                .collect::<Vec<_>>()
-        });
-
-        let predicate = convert_filters_to_predicate(&filters);
-
-        let mut builder = table.scan();
-        builder = match col_names {
-            Some(names) => builder.select(names),
-            None => builder.select_all(),
-        };
-        if let Some(pred) = predicate {
-            builder = builder.with_filter(pred);
-        }
-
-        let tasks = builder
-            .build()
-            .map_err(to_datafusion_error)?
-            .plan_files()
-            .await
-            .map_err(to_datafusion_error)?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(to_datafusion_error)?;
-
-        let output_schema = match &projection {
-            None => self.schema.clone(),
-            Some(indices) => Arc::new(self.schema.project(indices).map_err(|e| {
-                DataFusionError::Internal(format!("schema projection failed: {e}"))
-            })?),
-        };
-
-        Ok(IcebergPartitionedScan::new(
-            tasks,
-            table.file_io().clone(),
-            output_schema,
-        ))
-    }
 }
 
 #[async_trait]
@@ -119,14 +63,58 @@ impl TableProvider for IcebergPartitionedTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // limit is a hint only; DataFusion inserts a GlobalLimitExec above us anyway
-        let _ = limit;
-        let scan = self
-            .scan_without_session(projection.cloned(), filters.to_vec())
-            .await?;
-        Ok(Arc::new(scan))
+        // Second load: fetch the latest snapshot so scans always reflect current table state.
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // TODO: schema staleness risk, projection indices are resolved against self.schema,
+        // which was captured at try_new time. If the table schema evolved between try_new and
+        // this scan, the column names may be incorrect. This logic is inherited from IcebergTableProvider.
+        let col_names = projection.map(|indices| {
+            indices
+                .iter()
+                .map(|&i| self.schema.field(i).name().clone())
+                .collect::<Vec<_>>()
+        });
+
+        let predicate = convert_filters_to_predicate(filters);
+
+        let mut builder = table.scan();
+        builder = match col_names {
+            Some(names) => builder.select(names),
+            None => builder.select_all(),
+        };
+        if let Some(pred) = predicate {
+            builder = builder.with_filter(pred);
+        }
+
+        let tasks = builder
+            .build()
+            .map_err(to_datafusion_error)?
+            .plan_files()
+            .await
+            .map_err(to_datafusion_error)?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(to_datafusion_error)?;
+
+        let output_schema = match projection {
+            None => self.schema.clone(),
+            Some(indices) => Arc::new(self.schema.project(indices).map_err(|e| {
+                DataFusionError::Internal(format!("schema projection failed: {e}"))
+            })?),
+        };
+
+        Ok(Arc::new(IcebergPartitionedScan::new(
+            tasks,
+            table.file_io().clone(),
+            output_schema,
+        )))
     }
 
     fn supports_filters_pushdown(
@@ -160,6 +148,7 @@ mod tests {
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema, Type,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use datafusion::prelude::SessionContext;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use tempfile::TempDir;
 
@@ -260,7 +249,11 @@ mod tests {
         let provider = IcebergPartitionedTableProvider::try_new(catalog, namespace, table_name)
             .await
             .unwrap();
-        let scan = provider.scan_without_session(None, vec![]).await.unwrap();
+        let plan = provider
+            .scan(&SessionContext::new().state(), None, &[], None)
+            .await
+            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergPartitionedScan>().unwrap();
 
         assert_eq!(scan.tasks().len(), 0);
         assert_eq!(scan.properties().partitioning.partition_count(), 0);
@@ -276,7 +269,11 @@ mod tests {
         let provider = IcebergPartitionedTableProvider::try_new(catalog, namespace, table_name)
             .await
             .unwrap();
-        let scan = provider.scan_without_session(None, vec![]).await.unwrap();
+        let plan = provider
+            .scan(&SessionContext::new().state(), None, &[], None)
+            .await
+            .unwrap();
+        let scan = plan.as_any().downcast_ref::<IcebergPartitionedScan>().unwrap();
 
         assert_eq!(scan.tasks().len(), 3);
         assert_eq!(scan.properties().partitioning.partition_count(), 3);
