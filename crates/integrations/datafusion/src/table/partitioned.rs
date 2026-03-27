@@ -41,7 +41,6 @@ impl IcebergPartitionedTableProvider {
             schema,
         })
     }
-
 }
 
 #[async_trait]
@@ -142,12 +141,12 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use datafusion::prelude::SessionContext;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema, Type,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use datafusion::prelude::SessionContext;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use tempfile::TempDir;
 
@@ -252,7 +251,10 @@ mod tests {
             .scan(&SessionContext::new().state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergPartitionedScan>().unwrap();
+        let scan = plan
+            .as_any()
+            .downcast_ref::<IcebergPartitionedScan>()
+            .unwrap();
 
         assert_eq!(scan.tasks().len(), 0);
         assert_eq!(scan.properties().partitioning.partition_count(), 0);
@@ -272,7 +274,10 @@ mod tests {
             .scan(&SessionContext::new().state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergPartitionedScan>().unwrap();
+        let scan = plan
+            .as_any()
+            .downcast_ref::<IcebergPartitionedScan>()
+            .unwrap();
 
         assert_eq!(scan.tasks().len(), 3);
         assert_eq!(scan.properties().partitioning.partition_count(), 3);
