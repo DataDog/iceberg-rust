@@ -12,6 +12,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use tokio::runtime::Handle;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
@@ -22,6 +23,7 @@ pub struct IcebergPartitionedTableProvider {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     schema: ArrowSchemaRef,
+    io_handle: Option<Handle>,
 }
 
 impl IcebergPartitionedTableProvider {
@@ -39,7 +41,18 @@ impl IcebergPartitionedTableProvider {
             catalog,
             table_ident,
             schema,
+            io_handle: None,
         })
+    }
+
+    /// Attaches an IO runtime handle to this provider.
+    ///
+    /// When set, every [`IcebergPartitionedScan`] produced by [`scan()`](Self::scan) will have
+    /// the handle injected via [`IcebergPartitionedScan::with_io_handle`], ensuring that Parquet
+    /// reads via opendal run on the IO runtime rather than the CPU runtime.
+    pub fn with_io_handle(mut self, handle: Handle) -> Self {
+        self.io_handle = Some(handle);
+        self
     }
 }
 
@@ -108,11 +121,13 @@ impl TableProvider for IcebergPartitionedTableProvider {
             })?),
         };
 
-        Ok(Arc::new(IcebergPartitionedScan::new(
-            tasks,
-            table.file_io().clone(),
-            output_schema,
-        )))
+        let scan = IcebergPartitionedScan::new(tasks, table.file_io().clone(), output_schema);
+        let scan = match &self.io_handle {
+            Some(h) => scan.with_io_handle(h.clone()),
+            None => scan,
+        };
+
+        Ok(Arc::new(scan))
     }
 
     fn supports_filters_pushdown(
