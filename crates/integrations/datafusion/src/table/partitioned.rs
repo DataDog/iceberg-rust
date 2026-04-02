@@ -50,9 +50,45 @@ impl IcebergPartitionedTableProvider {
     /// When set, every [`IcebergPartitionedScan`] produced by [`scan()`](Self::scan) will have
     /// the handle injected via [`IcebergPartitionedScan::with_io_handle`], ensuring that Parquet
     /// reads via opendal run on the IO runtime rather than the CPU runtime.
+    ///
+    /// Additionally, the network I/O performed during `scan()` itself (`load_table` and
+    /// `plan_files`) is spawned on this handle, preventing DNS / HTTP calls from running
+    /// on the CPU runtime during DataFusion's physical planning phase.
     pub fn with_io_handle(mut self, handle: Handle) -> Self {
         self.io_handle = Some(handle);
         self
+    }
+
+    /// Fetches the file scan tasks for this table.
+    ///
+    /// Performs all network I/O: `load_table` (REST catalog) and `plan_files` (manifest reads).
+    /// Extracted as a static method so it can be spawned on the IO runtime via
+    /// `io_handle.spawn()` when runtime segregation is enabled.
+    async fn fetch_tasks(
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        col_names: Option<Vec<String>>,
+        predicate: Option<iceberg::expr::Predicate>,
+    ) -> Result<(iceberg::io::FileIO, Vec<iceberg::scan::FileScanTask>)> {
+        let table = catalog.load_table(&table_ident).await?;
+
+        let mut builder = table.scan();
+        builder = match col_names {
+            Some(names) => builder.select(names),
+            None => builder.select_all(),
+        };
+        if let Some(pred) = predicate {
+            builder = builder.with_filter(pred);
+        }
+
+        let tasks = builder
+            .build()?
+            .plan_files()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok((table.file_io().clone(), tasks))
     }
 }
 
@@ -77,13 +113,6 @@ impl TableProvider for IcebergPartitionedTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Second load: fetch the latest snapshot so scans always reflect current table state.
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
-
         // Projection indices are resolved against self.schema (captured at try_new time),
         // same as IcebergTableProvider / IcebergTableScan.
         let col_names = projection.map(|indices| {
@@ -95,24 +124,31 @@ impl TableProvider for IcebergPartitionedTableProvider {
 
         let predicate = convert_filters_to_predicate(filters);
 
-        let mut builder = table.scan();
-        builder = match col_names {
-            Some(names) => builder.select(names),
-            None => builder.select_all(),
+        // `load_table` (REST catalog) and `plan_files` (manifest reads) both trigger network I/O.
+        // When runtime segregation is enabled, DataFusion calls `scan()` on the CPU runtime during
+        // physical planning. Spawning on the IO handle prevents DNS / HTTP calls from running on
+        // the CPU runtime and causing a panic.
+        let catalog = Arc::clone(&self.catalog);
+        let table_ident = self.table_ident.clone();
+        let (file_io, tasks) = match &self.io_handle {
+            Some(h) => h
+                .spawn(Self::fetch_tasks(
+                    catalog,
+                    table_ident,
+                    col_names,
+                    predicate,
+                ))
+                .await
+                .map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "IcebergPartitionedScan: IO task panicked: {e}"
+                    ))
+                })?
+                .map_err(to_datafusion_error)?,
+            None => Self::fetch_tasks(catalog, table_ident, col_names, predicate)
+                .await
+                .map_err(to_datafusion_error)?,
         };
-        if let Some(pred) = predicate {
-            builder = builder.with_filter(pred);
-        }
-
-        let tasks = builder
-            .build()
-            .map_err(to_datafusion_error)?
-            .plan_files()
-            .await
-            .map_err(to_datafusion_error)?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(to_datafusion_error)?;
 
         let output_schema = match projection {
             None => self.schema.clone(),
@@ -121,7 +157,7 @@ impl TableProvider for IcebergPartitionedTableProvider {
             })?),
         };
 
-        let scan = IcebergPartitionedScan::new(tasks, table.file_io().clone(), output_schema);
+        let scan = IcebergPartitionedScan::new(tasks, file_io, output_schema);
         let scan = match &self.io_handle {
             Some(h) => scan.with_io_handle(h.clone()),
             None => scan,
