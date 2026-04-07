@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 use crate::to_datafusion_error;
 
 /// Channel buffer size for streaming record batches between runtimes.
+///
+/// Mirrors the constant used in `dd-datafusion`'s `IOExec`.
 const CHANNEL_BUFFER_SIZE: usize = 32;
 
 /// A DataFusion [`ExecutionPlan`] that reads one [`FileScanTask`] per partition.
@@ -143,6 +145,11 @@ impl ExecutionPlan for IcebergPartitionedScan {
             Some(io_handle) => {
                 let (tx, rx) = mpsc::channel::<DFResult<RecordBatch>>(CHANNEL_BUFFER_SIZE);
 
+                // The JoinHandle is intentionally dropped (task detached).
+                // Errors from the arrow reader are forwarded via the channel.
+                // If the task panics, `tx` is dropped, the channel closes, and
+                // the consumer sees end-of-stream. This matches the behaviour of
+                // `dd-datafusion`'s `IOExec`.
                 io_handle.spawn(async move {
                     let task_stream = futures::stream::once(futures::future::ready(Ok(task)));
                     match ArrowReaderBuilder::new(file_io)
@@ -151,11 +158,15 @@ impl ExecutionPlan for IcebergPartitionedScan {
                         .map_err(to_datafusion_error)
                     {
                         Err(e) => {
+                            // If the receiver is dropped (query cancelled), there is nothing to
+                            // propagate the error to.
+                            // Mirrors `dd-datafusion`'s `IOExec`.
                             let _ = tx.send(Err(e)).await;
                         }
                         Ok(stream) => {
                             let mut stream = stream.map_err(to_datafusion_error);
                             while let Some(batch) = stream.next().await {
+                                // If the receiver is dropped, stop processing.
                                 if tx.send(batch).await.is_err() {
                                     break;
                                 }

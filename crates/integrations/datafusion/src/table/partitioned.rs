@@ -11,6 +11,8 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::io::FileIO;
+use iceberg::scan::FileScanTask;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use tokio::runtime::Handle;
 
@@ -69,7 +71,7 @@ impl IcebergPartitionedTableProvider {
         table_ident: TableIdent,
         col_names: Option<Vec<String>>,
         predicate: Option<iceberg::expr::Predicate>,
-    ) -> Result<(iceberg::io::FileIO, Vec<iceberg::scan::FileScanTask>)> {
+    ) -> Result<(FileIO, Vec<FileScanTask>)> {
         let table = catalog.load_table(&table_ident).await?;
 
         let mut builder = table.scan();
@@ -157,11 +159,10 @@ impl TableProvider for IcebergPartitionedTableProvider {
             })?),
         };
 
-        let scan = IcebergPartitionedScan::new(tasks, file_io, output_schema);
-        let scan = match &self.io_handle {
-            Some(h) => scan.with_io_handle(h.clone()),
-            None => scan,
-        };
+        let mut scan = IcebergPartitionedScan::new(tasks, file_io, output_schema);
+        if let Some(h) = &self.io_handle {
+            scan = scan.with_io_handle(h.clone());
+        }
 
         Ok(Arc::new(scan))
     }
