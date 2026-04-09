@@ -26,6 +26,7 @@ mod schema;
 pub mod table;
 pub use physical_plan::IcebergBucketScan;
 pub use physical_plan::IcebergPartitionedScan;
+pub use table::bucket::IcebergBucketTableProvider;
 pub use table::partitioned::IcebergPartitionedTableProvider;
 pub use table::table_provider_factory::IcebergTableProviderFactory;
 pub use table::*;

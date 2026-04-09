@@ -25,6 +25,7 @@
 //! - [`IcebergStaticTableProvider`]: Static provider for read-only access to a specific
 //!   table snapshot. Use for consistent analytical queries or time-travel scenarios.
 
+pub mod bucket;
 pub mod metadata_table;
 pub mod partitioned;
 pub mod table_provider_factory;
