@@ -173,8 +173,13 @@ impl TableProvider for IcebergBucketTableProvider {
 
         let tasks_by_bucket = group_tasks_by_bucket(tasks, &info);
 
-        let mut scan =
-            IcebergBucketScan::new(tasks_by_bucket, file_io, output_schema, source_col_expr);
+        let mut scan = IcebergBucketScan::new(
+            tasks_by_bucket,
+            file_io,
+            output_schema,
+            source_col_expr,
+            info.bucket_count as usize,
+        );
         if let Some(h) = &self.io_handle {
             scan = scan.with_io_handle(h.clone());
         }
@@ -233,10 +238,17 @@ fn detect_bucket_field(
         })
 }
 
-/// Groups `FileScanTask`s by their Iceberg bucket value.
+/// Groups `FileScanTask`s by their Iceberg bucket value, retaining only non-empty groups.
 ///
-/// Returns a `Vec` of length `info.bucket_count`; entry `i` contains all tasks whose bucket
-/// value equals `i`. Tasks whose partition value is absent or out of range are silently ignored.
+/// Tasks are distributed into `bucket_count` slots by bucket value. Empty slots are then
+/// discarded, so the returned `Vec` contains only groups with at least one task. Its length
+/// equals the number of distinct populated buckets (≤ `info.bucket_count`).
+///
+/// This ensures `IcebergBucketScan` creates DataFusion partitions only for buckets that
+/// actually have data — including after Iceberg predicate pruning, where `plan_files()` may
+/// already have reduced the task list to a single bucket.
+///
+/// Tasks whose partition value is absent or out of range are silently ignored.
 fn group_tasks_by_bucket(
     tasks: Vec<FileScanTask>,
     info: &BucketFieldInfo,
@@ -250,7 +262,10 @@ fn group_tasks_by_bucket(
             }
         }
     }
-    groups
+    // Drop empty groups: only populated buckets become DataFusion partitions.
+    // Partitioning::Hash([source_col], K) remains correct: same source_col value →
+    // same Iceberg bucket (deterministic) → same surviving partition.
+    groups.into_iter().filter(|g| !g.is_empty()).collect()
 }
 
 /// Extracts the integer bucket value stored in `FileScanTask.partition` at `field_idx`.

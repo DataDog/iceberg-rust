@@ -36,12 +36,17 @@ const CHANNEL_BUFFER_SIZE: usize = 32;
 /// pattern as [`IcebergPartitionedScan`](crate::physical_plan::partitioned_scan::IcebergPartitionedScan).
 #[derive(Debug, Clone)]
 pub struct IcebergBucketScan {
-    /// `tasks_by_bucket[i]` = all FileScanTasks whose Iceberg bucket value equals `i`.
-    /// `len()` equals the bucket count N. Inner Vec may be empty (no files for that bucket).
+    /// Non-empty groups of FileScanTasks, one group per active Iceberg bucket.
+    /// `len()` equals the number of populated buckets K (≤ N total bucket count).
+    /// Empty buckets are excluded: only buckets with at least one data file after
+    /// Iceberg predicate pruning become DataFusion partitions.
     tasks_by_bucket: Vec<Vec<FileScanTask>>,
     file_io: FileIO,
     plan_properties: PlanProperties,
     io_handle: Option<Handle>,
+    /// Total bucket count N from the partition spec. Stored for display and codec purposes;
+    /// may differ from `tasks_by_bucket.len()` when some buckets are empty or pruned.
+    bucket_count: usize,
 }
 
 impl IcebergBucketScan {
@@ -50,11 +55,12 @@ impl IcebergBucketScan {
         file_io: FileIO,
         schema: ArrowSchemaRef,
         source_col_expr: Arc<dyn PhysicalExpr>,
+        bucket_count: usize,
     ) -> Self {
-        let bucket_count = tasks_by_bucket.len();
+        let active_buckets = tasks_by_bucket.len();
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::Hash(vec![source_col_expr], bucket_count),
+            Partitioning::Hash(vec![source_col_expr], active_buckets),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -63,6 +69,7 @@ impl IcebergBucketScan {
             file_io,
             plan_properties,
             io_handle: None,
+            bucket_count,
         }
     }
 
@@ -202,7 +209,8 @@ impl DisplayAs for IcebergBucketScan {
             .and_then(|t| t.predicate())
             .map_or(String::new(), |p| format!("{p}"));
         let total_files: usize = self.tasks_by_bucket.iter().map(|g| g.len()).sum();
-        let bucket_count = self.tasks_by_bucket.len();
+        let active_buckets = self.tasks_by_bucket.len();
+        let bucket_count = self.bucket_count;
         let io_tag = if self.io_handle.is_some() {
             " [io-runtime]"
         } else {
@@ -211,7 +219,7 @@ impl DisplayAs for IcebergBucketScan {
         write!(
             f,
             "{}{io_tag} projection:[{projection}] predicate:[{predicate}] \
-             buckets:[{bucket_count}] total_files:[{total_files}]",
+             active_buckets:[{active_buckets}/{bucket_count}] total_files:[{total_files}]",
             self.name()
         )
     }
