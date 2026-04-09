@@ -83,12 +83,20 @@ impl IcebergBucketScan {
         self
     }
 
-    pub fn tasks_by_bucket(&self) -> &[Vec<FileScanTask>] {
-        &self.tasks_by_bucket
+    /// Returns the total bucket count N from the partition spec.
+    ///
+    /// This may differ from `tasks_by_bucket().len()` when some buckets are empty or pruned
+    /// by predicate pushdown.
+    pub fn bucket_count(&self) -> usize {
+        self.bucket_count
     }
 
     pub fn file_io(&self) -> &FileIO {
         &self.file_io
+    }
+
+    pub fn tasks_by_bucket(&self) -> &[Vec<FileScanTask>] {
+        &self.tasks_by_bucket
     }
 }
 
