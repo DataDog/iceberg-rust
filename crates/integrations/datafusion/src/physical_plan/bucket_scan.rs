@@ -224,9 +224,18 @@ impl DisplayAs for IcebergBucketScan {
         } else {
             ""
         };
+        let partition_spec = match self.properties().output_partitioning() {
+            Partitioning::Hash(exprs, _) => exprs
+                .iter()
+                .map(|e| format!("bucket({bucket_count}, {e})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            other => format!("{other:?}"),
+        };
         write!(
             f,
             "{}{io_tag} projection:[{projection}] predicate:[{predicate}] \
+             partition_spec:[{partition_spec}] \
              active_buckets:[{active_buckets}/{bucket_count}] total_files:[{total_files}]",
             self.name()
         )

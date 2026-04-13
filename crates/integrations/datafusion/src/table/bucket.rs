@@ -95,7 +95,12 @@ impl IcebergBucketTableProvider {
             .try_collect::<Vec<_>>()
             .await?;
 
-        Ok((table.file_io().clone(), tasks, partition_spec, iceberg_schema))
+        Ok((
+            table.file_io().clone(),
+            tasks,
+            partition_spec,
+            iceberg_schema,
+        ))
     }
 }
 
@@ -141,9 +146,7 @@ impl TableProvider for IcebergBucketTableProvider {
                 ))
                 .await
                 .map_err(|e| {
-                    DataFusionError::Internal(format!(
-                        "IcebergBucketScan: IO task panicked: {e}"
-                    ))
+                    DataFusionError::Internal(format!("IcebergBucketScan: IO task panicked: {e}"))
                 })?
                 .map_err(to_datafusion_error)?,
             None => Self::fetch_tasks(catalog, table_ident, col_names, predicate)
@@ -167,9 +170,8 @@ impl TableProvider for IcebergBucketTableProvider {
                 )
             })?;
 
-        let source_col_expr =
-            Arc::new(Column::new(&info.source_col_name, info.source_col_idx))
-                as Arc<dyn PhysicalExpr>;
+        let source_col_expr = Arc::new(Column::new(&info.source_col_name, info.source_col_idx))
+            as Arc<dyn PhysicalExpr>;
 
         let tasks_by_bucket = group_tasks_by_bucket(tasks, &info);
 
@@ -194,10 +196,6 @@ impl TableProvider for IcebergBucketTableProvider {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 struct BucketFieldInfo {
     /// Index of the bucket field within `PartitionSpec.fields()`.
@@ -245,7 +243,7 @@ fn detect_bucket_field(
 /// equals the number of distinct populated buckets (≤ `info.bucket_count`).
 ///
 /// This ensures `IcebergBucketScan` creates DataFusion partitions only for buckets that
-/// actually have data — including after Iceberg predicate pruning, where `plan_files()` may
+/// actually have data, including after Iceberg predicate pruning, where `plan_files()` may
 /// already have reduced the task list to a single bucket.
 ///
 /// Tasks whose partition value is absent or out of range are silently ignored.
@@ -264,7 +262,7 @@ fn group_tasks_by_bucket(
     }
     // Drop empty groups: only populated buckets become DataFusion partitions.
     // Partitioning::Hash([source_col], K) remains correct: same source_col value →
-    // same Iceberg bucket (deterministic) → same surviving partition.
+    // same Iceberg bucket (deterministic) = same surviving partition.
     groups.into_iter().filter(|g| !g.is_empty()).collect()
 }
 
