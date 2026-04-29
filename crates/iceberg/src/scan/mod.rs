@@ -477,16 +477,17 @@ impl TableScan {
     /// (concurrency, batch size, row-group filtering, row selection) is
     /// taken from `self` and may differ from the planning scan.
     pub fn to_arrow_from_tasks(&self, tasks: FileScanTaskStream) -> Result<ArrowRecordBatchStream> {
-        let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
-            .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
-            .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
+        let mut arrow_reader_builder =
+            ArrowReaderBuilder::new(self.file_io.clone(), self.runtime.clone())
+                .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
+                .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
+                .with_row_selection_enabled(self.row_selection_enabled);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
 
-        arrow_reader_builder.build().read(tasks)
+        arrow_reader_builder.build().read(tasks).map(|r| r.stream())
     }
 
     /// Returns a reference to the column names of the table scan.
