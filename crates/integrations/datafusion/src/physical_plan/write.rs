@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -302,7 +301,6 @@ impl ExecutionPlan for IcebergWriteExec {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use std::collections::HashMap;
     use std::fmt::{Debug, Formatter};
     use std::sync::Arc;
@@ -373,10 +371,6 @@ mod tests {
     impl ExecutionPlan for MockExecutionPlan {
         fn name(&self) -> &str {
             "MockExecutionPlan"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {

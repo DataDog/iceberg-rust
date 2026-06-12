@@ -30,7 +30,6 @@ pub use bucketing::PartitionKeysKind;
 pub mod metadata_table;
 pub mod table_provider_factory;
 
-use std::any::Any;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 

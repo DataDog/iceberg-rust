@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -326,10 +325,6 @@ mod tests {
     impl ExecutionPlan for MockWriteExec {
         fn name(&self) -> &str {
             "MockWriteExec"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn schema(&self) -> Arc<ArrowSchema> {
