@@ -129,10 +129,6 @@ impl ExecutionPlan for IcebergCommitExec {
         "IcebergCommitExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
@@ -494,7 +490,7 @@ mod tests {
         assert_eq!(count_array.data_type(), &DataType::UInt64);
 
         // Verify that the count is correct
-        let count = count_array.as_any().downcast_ref::<UInt64Array>().unwrap();
+        let count = count_array.downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(count.value(0), 300);
 
         // Verify that the table has been updated with the new files

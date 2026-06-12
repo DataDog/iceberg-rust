@@ -107,10 +107,6 @@ impl IcebergSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for IcebergSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables
             .iter()

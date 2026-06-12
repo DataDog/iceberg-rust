@@ -162,10 +162,6 @@ impl IcebergTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -420,10 +416,6 @@ impl IcebergStaticTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -1109,7 +1101,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(8).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert_eq!(scan.buckets().len(), 1);
         assert_eq!(scan.buckets()[0].len(), 0);
@@ -1135,7 +1127,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         let total_files: usize = scan.buckets().iter().map(|b| b.len()).sum();
         assert_eq!(total_files, 5);
@@ -1162,7 +1154,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(16).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert_eq!(scan.buckets().len(), 2);
     }
@@ -1182,7 +1174,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(1).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert_eq!(scan.buckets().len(), 1);
         assert_eq!(scan.buckets()[0].len(), 4);
@@ -1317,7 +1309,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         let total_files: usize = scan.buckets().iter().map(|b| b.len()).sum();
         assert_eq!(total_files, 6);
@@ -1364,7 +1356,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert!(matches!(
             scan.properties().partitioning,
@@ -1512,7 +1504,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(4).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         let total_files: usize = scan.buckets().iter().map(|b| b.len()).sum();
         assert_eq!(total_files, 6);
@@ -1567,7 +1559,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert!(matches!(
             scan.properties().partitioning,
@@ -1599,7 +1591,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert!(matches!(
             scan.properties().partitioning,
@@ -1706,7 +1698,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         assert!(matches!(
             scan.properties().partitioning,
@@ -1827,7 +1819,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         match &scan.properties().partitioning {
             Partitioning::Hash(exprs, n) => {
@@ -1877,7 +1869,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(8).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
         let buckets = scan.buckets();
 
         assert_eq!(buckets.len(), 8);
@@ -1926,7 +1918,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(3).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
         let buckets = scan.buckets();
 
         assert_eq!(buckets.len(), 3);
@@ -2067,7 +2059,7 @@ mod tests {
             .scan(&ctx_with_target_partitions(4).state(), None, &[], None)
             .await
             .unwrap();
-        let scan = plan.as_any().downcast_ref::<IcebergTableScan>().unwrap();
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
 
         match &scan.properties().partitioning {
             Partitioning::UnknownPartitioning(_) => {}
