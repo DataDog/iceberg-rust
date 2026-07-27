@@ -86,7 +86,7 @@ impl fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    fn from_tokio_handle(handle: tokio::runtime::Handle) -> Self {
+    pub(crate) fn from_tokio_handle(handle: tokio::runtime::Handle) -> Self {
         Self { handle }
     }
 
@@ -162,6 +162,17 @@ impl Runtime {
         Self {
             io: RuntimeHandle::from_tokio_handle(io_runtime.handle().clone()),
             cpu: RuntimeHandle::from_tokio_handle(cpu_runtime.handle().clone()),
+        }
+    }
+
+    /// Create a Runtime with separate tokio runtime handles for IO and CPU work.
+    pub fn new_with_handles(
+        io_handle: tokio::runtime::Handle,
+        cpu_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            io: RuntimeHandle::from_tokio_handle(io_handle),
+            cpu: RuntimeHandle::from_tokio_handle(cpu_handle),
         }
     }
 

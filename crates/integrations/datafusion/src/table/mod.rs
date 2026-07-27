@@ -93,7 +93,7 @@ impl IcebergTableProvider {
         Self::try_new_optional_runtime(catalog, namespace, name, Some(runtime)).await
     }
 
-    pub(crate) async fn try_new_optional_runtime(
+    pub async fn try_new_optional_runtime(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
@@ -761,9 +761,10 @@ mod tests {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
-        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
-            .await
-            .unwrap();
+        let provider =
+            IcebergTableProvider::try_new_optional_runtime(catalog, namespace, table_name, None)
+                .await
+                .unwrap();
         let ctx = SessionContext::new();
 
         for (insert_op, expected_message) in [

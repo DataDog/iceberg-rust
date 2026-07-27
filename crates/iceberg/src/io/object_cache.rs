@@ -100,6 +100,7 @@ impl ObjectCache {
             cache: self.cache.clone(),
             file_io,
             cache_disabled: self.cache_disabled,
+            encryption_manager: self.encryption_manager.clone(),
         }
     }
 

@@ -102,8 +102,18 @@ impl FileIO {
     }
 
     /// Route IO-bound storage operations through the IO handle in `runtime`.
+    ///
+    /// If called with [`Self::with_io_runtime`], the last call wins.
     pub fn with_runtime(mut self, runtime: Runtime) -> Self {
         self.io_runtime = Some(runtime.io().clone());
+        self
+    }
+
+    /// Route IO-bound storage operations through `io_handle`.
+    ///
+    /// If called with [`Self::with_runtime`], the last call wins.
+    pub fn with_io_runtime(mut self, io_handle: tokio::runtime::Handle) -> Self {
+        self.io_runtime = Some(RuntimeHandle::from_tokio_handle(io_handle));
         self
     }
 
@@ -250,8 +260,18 @@ impl FileIOBuilder {
     }
 
     /// Route IO-bound storage operations through the IO handle in `runtime`.
+    ///
+    /// If called with [`Self::with_io_runtime`], the last call wins.
     pub fn with_runtime(mut self, runtime: Runtime) -> Self {
         self.io_runtime = Some(runtime.io().clone());
+        self
+    }
+
+    /// Route IO-bound storage operations through `io_handle`.
+    ///
+    /// If called with [`Self::with_runtime`], the last call wins.
+    pub fn with_io_runtime(mut self, io_handle: tokio::runtime::Handle) -> Self {
+        self.io_runtime = Some(RuntimeHandle::from_tokio_handle(io_handle));
         self
     }
 
