@@ -362,7 +362,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_register_empty_table_succeeds() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
@@ -385,7 +385,7 @@ mod tests {
         assert!(schema_provider.table_exist("empty_table"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_register_duplicate_table_fails() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
@@ -415,7 +415,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_deregister_table_succeeds() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 

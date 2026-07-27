@@ -305,7 +305,7 @@ mod tests {
         let result = expr.evaluate(&batch).unwrap();
         match result {
             ColumnarValue::Array(array) => {
-                let struct_array = array.downcast_ref::<StructArray>().unwrap();
+                let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
                 let id_partition = struct_array
                     .column_by_name("id_partition")
                     .unwrap()
@@ -381,7 +381,7 @@ mod tests {
         let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let array = calculator.calculate(&batch).unwrap();
 
-        let struct_array = array.downcast_ref::<StructArray>().unwrap();
+        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
         let city_partition = struct_array
             .column_by_name("city_partition")
             .unwrap()

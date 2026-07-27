@@ -909,7 +909,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -940,7 +939,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -969,7 +967,6 @@ mod tests {
 
         // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
@@ -1318,7 +1315,6 @@ mod tests {
                 assert_eq!(*n, 3);
                 assert_eq!(exprs.len(), 1);
                 let col = exprs[0]
-                    .as_any()
                     .downcast_ref::<Column>()
                     .expect("expected Column expr");
                 assert_eq!(col.name(), "name");
@@ -1513,7 +1509,6 @@ mod tests {
                 assert_eq!(*n, 4);
                 assert_eq!(exprs.len(), 1);
                 let col = exprs[0]
-                    .as_any()
                     .downcast_ref::<Column>()
                     .expect("expected Column expr");
                 assert_eq!(col.name(), "name");
@@ -1829,7 +1824,6 @@ mod tests {
                     "only the identity column should be retained"
                 );
                 let col = exprs[0]
-                    .as_any()
                     .downcast_ref::<Column>()
                     .expect("expected Column expr");
                 assert_eq!(col.name(), "country");
