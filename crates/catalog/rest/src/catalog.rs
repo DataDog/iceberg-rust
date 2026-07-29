@@ -115,6 +115,17 @@ impl CatalogBuilder for RestCatalogBuilder {
 }
 
 impl RestCatalogBuilder {
+    /// Routes storage operations through `io_handle`.
+    ///
+    /// Tables loaded by this catalog initially use the current Tokio runtime
+    /// for CPU work. Call [`Table::with_runtime`] to replace both
+    /// handles on a loaded table.
+    pub fn with_file_io_runtime(mut self, io_handle: tokio::runtime::Handle) -> Self {
+        let runtime = Runtime::new_with_handles(io_handle, tokio::runtime::Handle::current());
+        self.inner = self.inner.with_runtime(runtime);
+        self
+    }
+
     /// Configures the catalog with a custom HTTP client.
     pub fn with_client(mut self, client: Client) -> Self {
         self.inner = self.inner.with_client(client);
