@@ -21,7 +21,7 @@
 //! of transformed Arrow `RecordBatch`es.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::time::Instant;
 
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -104,6 +104,7 @@ struct FileScanTaskReader {
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
+        self.scan_metrics.file_scan_task_started();
         let should_load_page_index =
             (self.row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
         let mut parquet_read_options = self.parquet_read_options;
@@ -119,7 +120,7 @@ impl FileScanTaskReader {
             &self.file_io,
             task.file_size_in_bytes,
             parquet_read_options,
-            self.scan_metrics.bytes_read_counter(),
+            &self.scan_metrics,
         )
         .await?;
 
@@ -414,17 +415,26 @@ impl ArrowReader {
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
-        bytes_read: &Arc<AtomicU64>,
+        scan_metrics: &ScanMetrics,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
-        let counting_reader =
-            CountingFileRead::new(parquet_file.reader().await?, Arc::clone(bytes_read));
-        Self::build_parquet_reader(
+
+        let started = Instant::now();
+        let reader = parquet_file.reader().await;
+        scan_metrics.add_file_open_elapsed(started);
+        let reader = reader?;
+        scan_metrics.parquet_file_opened();
+
+        let counting_reader = CountingFileRead::new(reader, scan_metrics.clone());
+        let started = Instant::now();
+        let result = Self::build_parquet_reader(
             Box::new(counting_reader),
             file_size_in_bytes,
             parquet_read_options,
         )
-        .await
+        .await;
+        scan_metrics.add_parquet_metadata_load_elapsed(started);
+        result
     }
 
     async fn build_parquet_reader(

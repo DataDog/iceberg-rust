@@ -645,6 +645,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_catalog_backed_provider_scan_reports_metrics() {
+        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let provider =
+            Arc::new(new_catalog_backed_provider(&catalog, &namespace, &table_name).await);
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", provider.clone()).unwrap();
+        ctx.sql("INSERT INTO test_table VALUES (1, 'test')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let scan_plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let batches = datafusion::physical_plan::collect(Arc::clone(&scan_plan), ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+
+        let metrics = scan_plan.metrics().expect("scan should expose metrics");
+        assert_eq!(metrics.output_rows(), Some(1));
+        assert!(metrics.elapsed_compute().is_some_and(|value| value > 0));
+        assert!(
+            metrics
+                .sum_by_name("time_to_first_batch")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert!(
+            metrics
+                .sum_by_name("scan_elapsed")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert!(
+            metrics
+                .sum_by_name("storage_bytes_read")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert!(
+            metrics
+                .sum_by_name("storage_read_requests")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert_eq!(
+            metrics
+                .sum_by_name("storage_read_errors")
+                .map(|value| value.as_usize()),
+            Some(0)
+        );
+        assert!(
+            metrics
+                .sum_by_name("storage_read_elapsed")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert_eq!(
+            metrics
+                .sum_by_name("parquet_files_opened")
+                .map(|value| value.as_usize()),
+            Some(1)
+        );
+        assert!(
+            metrics
+                .sum_by_name("file_open_elapsed")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert!(
+            metrics
+                .sum_by_name("parquet_metadata_load_elapsed")
+                .is_some_and(|value| value.as_usize() > 0)
+        );
+        assert_eq!(
+            metrics
+                .sum_by_name("file_scan_tasks_started")
+                .map(|value| value.as_usize()),
+            Some(1)
+        );
+
+        let reset_plan = scan_plan.reset_state().unwrap();
+        assert!(
+            reset_plan
+                .metrics()
+                .expect("reset scan should expose metrics")
+                .iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_catalog_backed_provider_insert() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
 

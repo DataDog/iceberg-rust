@@ -20,6 +20,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -30,12 +31,12 @@ use crate::scan::ArrowRecordBatchStream;
 /// Wraps a [`FileRead`] to count bytes read via a shared atomic counter.
 pub(crate) struct CountingFileRead<F: FileRead> {
     inner: F,
-    bytes_read: Arc<AtomicU64>,
+    metrics: ScanMetrics,
 }
 
 impl<F: FileRead> CountingFileRead<F> {
-    pub(crate) fn new(inner: F, bytes_read: Arc<AtomicU64>) -> Self {
-        Self { inner, bytes_read }
+    pub(crate) fn new(inner: F, metrics: ScanMetrics) -> Self {
+        Self { inner, metrics }
     }
 }
 
@@ -43,9 +44,20 @@ impl<F: FileRead> CountingFileRead<F> {
 impl<F: FileRead> FileRead for CountingFileRead<F> {
     async fn read(&self, range: Range<u64>) -> Result<Bytes> {
         debug_assert!(range.end >= range.start);
-        self.bytes_read
+        self.metrics
+            .bytes_read
             .fetch_add(range.end - range.start, Ordering::Relaxed);
-        self.inner.read(range).await
+        self.metrics.read_requests.fetch_add(1, Ordering::Relaxed);
+
+        let started = Instant::now();
+        let result = self.inner.read(range).await;
+        self.metrics
+            .read_elapsed_nanos
+            .fetch_add(duration_as_u64_nanos(started), Ordering::Relaxed);
+        if result.is_err() {
+            self.metrics.read_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -53,23 +65,93 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    read_requests: Arc<AtomicU64>,
+    read_errors: Arc<AtomicU64>,
+    read_elapsed_nanos: Arc<AtomicU64>,
+    parquet_files_opened: Arc<AtomicU64>,
+    file_open_elapsed_nanos: Arc<AtomicU64>,
+    parquet_metadata_load_elapsed_nanos: Arc<AtomicU64>,
+    file_scan_tasks_started: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            read_requests: Arc::new(AtomicU64::new(0)),
+            read_errors: Arc::new(AtomicU64::new(0)),
+            read_elapsed_nanos: Arc::new(AtomicU64::new(0)),
+            parquet_files_opened: Arc::new(AtomicU64::new(0)),
+            file_open_elapsed_nanos: Arc::new(AtomicU64::new(0)),
+            parquet_metadata_load_elapsed_nanos: Arc::new(AtomicU64::new(0)),
+            file_scan_tasks_started: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub(crate) fn bytes_read_counter(&self) -> &Arc<AtomicU64> {
-        &self.bytes_read
+    pub(crate) fn file_scan_task_started(&self) {
+        self.file_scan_tasks_started.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Total bytes read from storage during this scan, including data files and delete files.
+    pub(crate) fn parquet_file_opened(&self) {
+        self.parquet_files_opened.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_file_open_elapsed(&self, started: Instant) {
+        self.file_open_elapsed_nanos
+            .fetch_add(duration_as_u64_nanos(started), Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_parquet_metadata_load_elapsed(&self, started: Instant) {
+        self.parquet_metadata_load_elapsed_nanos
+            .fetch_add(duration_as_u64_nanos(started), Ordering::Relaxed);
+    }
+
+    /// Total bytes requested from storage during this scan, including data and delete files.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
     }
+
+    /// Number of range-read requests issued to storage.
+    pub fn read_requests(&self) -> u64 {
+        self.read_requests.load(Ordering::Relaxed)
+    }
+
+    /// Number of storage range-read requests that returned an error.
+    pub fn read_errors(&self) -> u64 {
+        self.read_errors.load(Ordering::Relaxed)
+    }
+
+    /// Sum of storage range-read latency in nanoseconds.
+    ///
+    /// Concurrent requests overlap, so this can exceed wall-clock scan time.
+    pub fn read_elapsed_nanos(&self) -> u64 {
+        self.read_elapsed_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Number of Parquet data and delete files successfully opened.
+    pub fn parquet_files_opened(&self) -> u64 {
+        self.parquet_files_opened.load(Ordering::Relaxed)
+    }
+
+    /// Sum of time spent opening Parquet data and delete files in nanoseconds.
+    pub fn file_open_elapsed_nanos(&self) -> u64 {
+        self.file_open_elapsed_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Sum of time spent loading Parquet metadata in nanoseconds.
+    pub fn parquet_metadata_load_elapsed_nanos(&self) -> u64 {
+        self.parquet_metadata_load_elapsed_nanos
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of data-file scan tasks whose processing has started.
+    pub fn file_scan_tasks_started(&self) -> u64 {
+        self.file_scan_tasks_started.load(Ordering::Relaxed)
+    }
+}
+
+fn duration_as_u64_nanos(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Result of [`ArrowReader::read`](super::ArrowReader::read), containing the
