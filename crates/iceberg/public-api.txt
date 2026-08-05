@@ -95,6 +95,13 @@ pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_precomputed_va
 pub struct iceberg::arrow::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::file_open_elapsed_nanos(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::file_scan_tasks_started(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::parquet_files_opened(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::parquet_metadata_load_elapsed_nanos(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::read_elapsed_nanos(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::read_errors(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::read_requests(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
 impl core::fmt::Debug for iceberg::scan::ScanMetrics
@@ -1279,6 +1286,13 @@ pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: _
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::file_open_elapsed_nanos(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::file_scan_tasks_started(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::parquet_files_opened(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::parquet_metadata_load_elapsed_nanos(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::read_elapsed_nanos(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::read_errors(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::read_requests(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
 impl core::fmt::Debug for iceberg::scan::ScanMetrics

@@ -79,7 +79,7 @@ impl BasicDeleteFileLoader {
             &self.file_io,
             file_size_in_bytes,
             parquet_read_options,
-            self.scan_metrics.bytes_read_counter(),
+            &self.scan_metrics,
         )
         .await?;
 
