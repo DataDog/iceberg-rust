@@ -24,14 +24,15 @@ use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use datafusion::common::Result as DFResult;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    execute_input_stream,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties, ReplaceChildrenOptions, execute_input_stream,
 };
 use futures::StreamExt;
 use iceberg::arrow::FieldMatchMode;
@@ -66,13 +67,14 @@ pub(crate) struct IcebergWriteExec {
 }
 
 impl IcebergWriteExec {
-    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>, schema: ArrowSchemaRef) -> Self {
-        let plan_properties = Self::compute_properties(&input, schema);
+    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
+        let result_schema = Self::make_result_schema();
+        let plan_properties = Self::compute_properties(&input, Arc::clone(&result_schema));
 
         Self {
             table,
             input,
-            result_schema: Self::make_result_schema(),
+            result_schema,
             plan_properties,
         }
     }
@@ -137,6 +139,13 @@ impl ExecutionPlan for IcebergWriteExec {
         "IcebergWriteExec"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
@@ -155,9 +164,10 @@ impl ExecutionPlan for IcebergWriteExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
@@ -166,11 +176,26 @@ impl ExecutionPlan for IcebergWriteExec {
             )));
         }
 
-        Ok(Arc::new(Self::new(
-            self.table.clone(),
-            Arc::clone(&children[0]),
-            self.schema(),
-        )))
+        let input = children.swap_remove(0);
+        Ok(match options.children_properties {
+            ChildrenPropertiesMode::Keep => Arc::new(Self {
+                table: self.table.clone(),
+                input,
+                result_schema: Arc::clone(&self.result_schema),
+                plan_properties: Arc::clone(&self.plan_properties),
+            }),
+            ChildrenPropertiesMode::Recompute => Arc::new(Self::new(self.table.clone(), input)),
+        })
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     /// Executes the write operation for the given partition.
@@ -315,7 +340,10 @@ mod tests {
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+    use datafusion::physical_plan::{
+        ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        ReplaceChildrenOptions,
+    };
     use futures::{StreamExt, stream};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
@@ -374,6 +402,13 @@ mod tests {
             "MockExecutionPlan"
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
@@ -382,11 +417,22 @@ mod tests {
             vec![]
         }
 
-        fn with_new_children(
+        fn replace_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
+            _options: ReplaceChildrenOptions,
         ) -> DFResult<Arc<dyn ExecutionPlan>> {
             Ok(self)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
         }
 
         fn execute(
@@ -494,7 +540,32 @@ mod tests {
         ]));
 
         // 4. Create IcebergWriteExec
-        let write_exec = IcebergWriteExec::new(table.clone(), input_plan, arrow_schema);
+        let write_exec = Arc::new(IcebergWriteExec::new(table.clone(), input_plan));
+        assert_eq!(write_exec.schema(), IcebergWriteExec::make_result_schema());
+
+        let replacement_input =
+            Arc::new(MockExecutionPlan::new(arrow_schema, vec![])) as Arc<dyn ExecutionPlan>;
+        let original_properties = Arc::clone(write_exec.properties());
+        let kept_properties = Arc::clone(&write_exec)
+            .replace_children(
+                vec![Arc::clone(&replacement_input)],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+            )
+            .expect("replacing a write child with unchanged properties should succeed");
+        assert!(Arc::ptr_eq(
+            &original_properties,
+            kept_properties.properties()
+        ));
+        let recomputed_properties = Arc::clone(&write_exec)
+            .replace_children(
+                vec![replacement_input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .expect("replacing a write child should succeed");
+        assert!(!Arc::ptr_eq(
+            &original_properties,
+            recomputed_properties.properties()
+        ));
 
         // 5. Execute the plan
         let task_ctx = Arc::new(TaskContext::default());

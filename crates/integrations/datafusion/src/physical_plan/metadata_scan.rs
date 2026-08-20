@@ -18,10 +18,14 @@
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
+    ReplaceChildrenOptions,
+};
 use futures::TryStreamExt;
 
 use crate::metadata_table::IcebergMetadataTableProvider;
@@ -62,6 +66,13 @@ impl ExecutionPlan for IcebergMetadataScan {
         "IcebergMetadataScan"
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -70,11 +81,22 @@ impl ExecutionPlan for IcebergMetadataScan {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: std::sync::Arc<Self>,
         _children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn with_new_children(
+        self: std::sync::Arc<Self>,
+        children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
