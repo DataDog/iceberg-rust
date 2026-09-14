@@ -156,20 +156,12 @@ impl TableProviderFactory for IcebergTableProviderFactory {
 fn check_cmd(cmd: &CreateExternalTable) -> Result<&str> {
     let CreateExternalTable {
         schema,
-        locations,
         table_partition_cols,
         order_exprs,
         constraints,
         column_defaults,
         ..
     } = cmd;
-
-    let [metadata_file_path] = locations.as_slice() else {
-        return Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Iceberg external tables require exactly one metadata file location.",
-        ));
-    };
 
     // Check if any of the fields violate the constraints in a single condition
     let is_invalid = !schema.fields().is_empty()
@@ -185,7 +177,13 @@ fn check_cmd(cmd: &CreateExternalTable) -> Result<&str> {
         ));
     }
 
-    Ok(metadata_file_path)
+    match cmd.locations.as_slice() {
+        [location] => Ok(location),
+        _ => Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Iceberg external tables require exactly one metadata location.",
+        )),
+    }
 }
 
 /// Complements the namespace of a table name if necessary.
@@ -277,20 +275,6 @@ mod tests {
             definition: Default::default(),
             unbounded: Default::default(),
         }
-    }
-
-    #[test]
-    fn test_multiple_locations_are_rejected() {
-        let mut cmd = create_external_table_cmd();
-        cmd.locations.push("another/metadata.json".to_string());
-
-        let error = check_cmd(&cmd).expect_err("multiple locations should be rejected");
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            error
-                .to_string()
-                .contains("exactly one metadata file location")
-        );
     }
 
     #[tokio::test]

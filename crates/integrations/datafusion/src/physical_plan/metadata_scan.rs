@@ -22,10 +22,7 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
-    ReplaceChildrenOptions,
-};
+use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::TryStreamExt;
 
 use crate::metadata_table::IcebergMetadataTableProvider;
@@ -66,6 +63,14 @@ impl ExecutionPlan for IcebergMetadataScan {
         "IcebergMetadataScan"
     }
 
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
@@ -73,36 +78,17 @@ impl ExecutionPlan for IcebergMetadataScan {
         Ok(TreeNodeRecursion::Continue)
     }
 
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&std::sync::Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn replace_children(
-        self: std::sync::Arc<Self>,
-        _children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
-        _options: ReplaceChildrenOptions,
-    ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
     fn with_new_children(
-        self: std::sync::Arc<Self>,
-        children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
-        self.replace_children(
-            children,
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
     }
 
     fn execute(
         &self,
         _partition: usize,
-        _context: std::sync::Arc<datafusion::execution::TaskContext>,
+        _context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
         let fut = self.provider.clone().scan();
         let stream = futures::stream::once(fut).try_flatten();

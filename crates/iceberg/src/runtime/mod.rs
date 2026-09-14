@@ -22,24 +22,24 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::task;
+use tokio::task::JoinHandle as TokioJoinHandle;
 
 use crate::{Error, ErrorKind, Result};
 
-/// Wrapper around tokio's `JoinHandle` that converts task failures into
-/// [`iceberg::Error`].
+/// Wrapper around tokio's [`TokioJoinHandle`] that converts task failures into
+/// [`crate::Error`].
 ///
 /// Tokio's `JoinHandle<T>` resolves to `Result<T, JoinError>`, where a
-/// `JoinError` means the task either panicked or was cancelled (typically from
-/// runtime shutdown or `abort`). Both are surfaced here as
-/// `ErrorKind::Unexpected` with the original `JoinError` preserved as the
-/// source.
-pub struct JoinHandle<T>(task::JoinHandle<T>);
+/// [`tokio::task::JoinError`] means the task either panicked or was cancelled
+/// (typically from runtime shutdown or `abort`).
+/// Both are surfaced here as `ErrorKind::Unexpected` with the original
+/// [`tokio::task::JoinError`] preserved as the source.
+pub struct JoinHandle<T>(TokioJoinHandle<T>);
 
 impl<T> Unpin for JoinHandle<T> {}
 
 impl<T: Send + 'static> Future for JoinHandle<T> {
-    type Output = crate::Result<T>;
+    type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.get_mut().0).poll(cx).map(|r| {
@@ -48,7 +48,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
-pub(crate) struct AbortOnDropJoinHandle<T>(task::JoinHandle<T>);
+pub(crate) struct AbortOnDropJoinHandle<T>(TokioJoinHandle<T>);
 
 impl<T> Unpin for AbortOnDropJoinHandle<T> {}
 
@@ -59,7 +59,7 @@ impl<T> Drop for AbortOnDropJoinHandle<T> {
 }
 
 impl<T: Send + 'static> Future for AbortOnDropJoinHandle<T> {
-    type Output = crate::Result<T>;
+    type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.get_mut().0).poll(cx).map(|r| {
@@ -72,8 +72,8 @@ impl<T: Send + 'static> Future for AbortOnDropJoinHandle<T> {
 ///
 /// Wraps a [`tokio::runtime::Handle`], which is cheap to clone. The caller is
 /// responsible for keeping the underlying runtime alive while this handle is
-/// in use; spawning on a shut-down runtime will surface as a `JoinError` via
-/// [`JoinHandle`].
+/// in use; spawning on a shut-down runtime will surface as a [`tokio::task::JoinError`]
+/// via the returned [`JoinHandle`].
 #[derive(Clone)]
 pub struct RuntimeHandle {
     handle: tokio::runtime::Handle,
@@ -126,10 +126,10 @@ impl RuntimeHandle {
 ///
 /// # Lifetime
 ///
-/// A `Runtime` stores only `tokio::runtime::Handle`s (weak references). The
-/// caller owns the tokio runtime's lifetime. If the underlying runtime is
+/// A `Runtime` stores only `tokio::runtime::Handle`s (weak references).
+/// The caller owns the tokio runtime's lifetime. If the underlying runtime is
 /// dropped while iceberg is still using it, subsequent spawns will surface as
-/// task cancellation errors via [`JoinHandle`].
+/// task cancellation errors via the returned `JoinHandle`.
 ///
 /// Cloning is cheap.
 #[derive(Clone)]

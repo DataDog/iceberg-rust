@@ -28,7 +28,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::physical_plan::{ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
@@ -508,10 +508,7 @@ async fn test_iceberg_table_scan_rejects_non_empty_children() -> Result<()> {
 
     let child = Arc::new(EmptyExec::new(scan_plan.schema())) as Arc<dyn ExecutionPlan>;
     let error = scan_plan
-        .replace_children(
-            vec![child],
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )
+        .with_new_children(vec![child])
         .expect_err("IcebergTableScan should reject children");
 
     assert!(
@@ -604,6 +601,7 @@ async fn test_provider_list_table_names() -> Result<()> {
             "my_table",
             "my_table$snapshots",
             "my_table$manifests",
+            "my_table$history",
         ]
     "#]]
     .assert_debug_eq(&result);

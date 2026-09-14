@@ -28,10 +28,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    ReplaceChildrenOptions,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
 use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
@@ -132,19 +129,19 @@ impl ExecutionPlan for IcebergCommitExec {
         "IcebergCommitExec"
     }
 
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-    ) -> DFResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
@@ -155,10 +152,9 @@ impl ExecutionPlan for IcebergCommitExec {
         vec![false]
     }
 
-    fn replace_children(
+    fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-        options: ReplaceChildrenOptions,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
@@ -167,33 +163,12 @@ impl ExecutionPlan for IcebergCommitExec {
             )));
         }
 
-        let input = children.swap_remove(0);
-        Ok(match options.children_properties {
-            ChildrenPropertiesMode::Keep => Arc::new(Self {
-                table: self.table.clone(),
-                catalog: Arc::clone(&self.catalog),
-                input,
-                schema: Arc::clone(&self.schema),
-                count_schema: Arc::clone(&self.count_schema),
-                plan_properties: Arc::clone(&self.plan_properties),
-            }),
-            ChildrenPropertiesMode::Recompute => Arc::new(Self::new(
-                self.table.clone(),
-                Arc::clone(&self.catalog),
-                input,
-                Arc::clone(&self.schema),
-            )),
-        })
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.replace_children(
-            children,
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )
+        Ok(Arc::new(IcebergCommitExec::new(
+            self.table.clone(),
+            self.catalog.clone(),
+            children[0].clone(),
+            self.schema.clone(),
+        )))
     }
 
     fn execute(
@@ -309,10 +284,7 @@ mod tests {
     use datafusion::physical_plan::common::collect;
     use datafusion::physical_plan::execution_plan::Boundedness;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::{
-        ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        ReplaceChildrenOptions,
-    };
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
     use datafusion::prelude::*;
     use futures::StreamExt;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -362,13 +334,6 @@ mod tests {
             "MockWriteExec"
         }
 
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-        ) -> DFResult<TreeNodeRecursion> {
-            Ok(TreeNodeRecursion::Continue)
-        }
-
         fn schema(&self) -> Arc<ArrowSchema> {
             self.schema.clone()
         }
@@ -381,22 +346,18 @@ mod tests {
             vec![]
         }
 
-        fn replace_children(
-            self: Arc<Self>,
-            _children: Vec<Arc<dyn ExecutionPlan>>,
-            _options: ReplaceChildrenOptions,
-        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-            Ok(self)
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
             self: Arc<Self>,
-            children: Vec<Arc<dyn ExecutionPlan>>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-            self.replace_children(
-                children,
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
+            Ok(self)
         }
 
         fn execute(
@@ -505,8 +466,7 @@ mod tests {
         )?;
 
         // Create a mock execution plan that returns the serialized data files
-        let input_exec = Arc::new(MockWriteExec::new(vec![data_file1_json, data_file2_json]))
-            as Arc<dyn ExecutionPlan>;
+        let input_exec = Arc::new(MockWriteExec::new(vec![data_file1_json, data_file2_json]));
 
         // Create the IcebergCommitExec
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -515,34 +475,11 @@ mod tests {
             false,
         )]));
 
-        let commit_exec = Arc::new(IcebergCommitExec::new(
-            table.clone(),
-            catalog.clone(),
-            input_exec,
-            arrow_schema,
-        ));
+        let commit_exec =
+            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
-
-        let replacement_input = Arc::new(MockWriteExec::new(vec![])) as Arc<dyn ExecutionPlan>;
-        let original_properties = Arc::clone(commit_exec.properties());
-        let kept_properties = Arc::clone(&commit_exec).replace_children(
-            vec![Arc::clone(&replacement_input)],
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
-        )?;
-        assert!(Arc::ptr_eq(
-            &original_properties,
-            kept_properties.properties()
-        ));
-        let recomputed_properties = Arc::clone(&commit_exec).replace_children(
-            vec![replacement_input],
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )?;
-        assert!(!Arc::ptr_eq(
-            &original_properties,
-            recomputed_properties.properties()
-        ));
 
         // Execute the commit exec
         let task_ctx = Arc::new(TaskContext::default());
@@ -581,8 +518,9 @@ mod tests {
         assert!(!manifest_list.entries().is_empty());
 
         // Load the first manifest and verify it contains our data files
-        let manifest = manifest_list.entries()[0]
-            .load_manifest(updated_table.file_io())
+        let manifest = updated_table
+            .manifest_reader()
+            .read(&manifest_list.entries()[0])
             .await?;
 
         // Verify that the manifest contains our data files

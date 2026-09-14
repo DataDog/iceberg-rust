@@ -31,8 +31,8 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExp
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
-    PlanProperties, ReplaceChildrenOptions, execute_input_stream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    execute_input_stream,
 };
 use futures::StreamExt;
 use iceberg::arrow::FieldMatchMode;
@@ -68,13 +68,12 @@ pub(crate) struct IcebergWriteExec {
 
 impl IcebergWriteExec {
     pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
-        let result_schema = Self::make_result_schema();
-        let plan_properties = Self::compute_properties(&input, Arc::clone(&result_schema));
+        let plan_properties = Self::compute_properties(&input, Self::make_result_schema());
 
         Self {
             table,
             input,
-            result_schema,
+            result_schema: Self::make_result_schema(),
             plan_properties,
         }
     }
@@ -139,13 +138,6 @@ impl ExecutionPlan for IcebergWriteExec {
         "IcebergWriteExec"
     }
 
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-    ) -> DFResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
@@ -164,10 +156,16 @@ impl ExecutionPlan for IcebergWriteExec {
         vec![&self.input]
     }
 
-    fn replace_children(
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-        options: ReplaceChildrenOptions,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
@@ -176,26 +174,10 @@ impl ExecutionPlan for IcebergWriteExec {
             )));
         }
 
-        let input = children.swap_remove(0);
-        Ok(match options.children_properties {
-            ChildrenPropertiesMode::Keep => Arc::new(Self {
-                table: self.table.clone(),
-                input,
-                result_schema: Arc::clone(&self.result_schema),
-                plan_properties: Arc::clone(&self.plan_properties),
-            }),
-            ChildrenPropertiesMode::Recompute => Arc::new(Self::new(self.table.clone(), input)),
-        })
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.replace_children(
-            children,
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )
+        Ok(Arc::new(Self::new(
+            self.table.clone(),
+            Arc::clone(&children[0]),
+        )))
     }
 
     /// Executes the write operation for the given partition.
@@ -228,15 +210,14 @@ impl ExecutionPlan for IcebergWriteExec {
         let format_version = self.table.metadata().format_version();
 
         // Get typed table properties
-        let table_props = self
-            .table
-            .metadata()
-            .table_properties()
-            .map_err(to_datafusion_error)?;
+        let table_props = self.table.metadata().table_properties();
 
         // Check data file format
-        let file_format = DataFileFormat::from_str(&table_props.write_format_default)
+        let write_format_default = table_props
+            .write_format_default()
             .map_err(to_datafusion_error)?;
+        let file_format =
+            DataFileFormat::from_str(&write_format_default).map_err(to_datafusion_error)?;
         if file_format != DataFileFormat::Parquet {
             return Err(to_datafusion_error(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -247,12 +228,19 @@ impl ExecutionPlan for IcebergWriteExec {
         // Build the writer from the already-parsed table properties so it honors
         // `write.parquet.*` settings (e.g. CDC). Arrow batches flowing through
         // DataFusion carry no field-id metadata, so match fields by name.
-        let parquet_file_writer_builder = ParquetWriterBuilder::from_table_properties(
+        let mut parquet_file_writer_builder = ParquetWriterBuilder::from_table_properties(
             &table_props,
             self.table.metadata().current_schema().clone(),
         )
+        .map_err(to_datafusion_error)?
         .with_match_mode(FieldMatchMode::Name);
-        let target_file_size = table_props.write_target_file_size_bytes;
+        if let Some(encryption_manager) = self.table.encryption_manager() {
+            parquet_file_writer_builder =
+                parquet_file_writer_builder.with_encryption_manager(encryption_manager.clone());
+        }
+        let target_file_size = table_props
+            .write_target_file_size_bytes()
+            .map_err(to_datafusion_error)?;
 
         let file_io = self.table.file_io().clone();
         // todo location_gen and file_name_gen should be configurable
@@ -271,7 +259,9 @@ impl ExecutionPlan for IcebergWriteExec {
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
         // Create TaskWriter
-        let fanout_enabled = table_props.write_datafusion_fanout_enabled;
+        let fanout_enabled = table_props
+            .write_datafusion_fanout_enabled()
+            .map_err(to_datafusion_error)?;
         let schema = self.table.metadata().current_schema().clone();
         let partition_spec = self.table.metadata().default_partition_spec().clone();
         let task_writer = TaskWriter::try_new(
@@ -340,10 +330,7 @@ mod tests {
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::{
-        ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        ReplaceChildrenOptions,
-    };
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
     use futures::{StreamExt, stream};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
@@ -402,13 +389,6 @@ mod tests {
             "MockExecutionPlan"
         }
 
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-        ) -> DFResult<TreeNodeRecursion> {
-            Ok(TreeNodeRecursion::Continue)
-        }
-
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
@@ -417,22 +397,18 @@ mod tests {
             vec![]
         }
 
-        fn replace_children(
-            self: Arc<Self>,
-            _children: Vec<Arc<dyn ExecutionPlan>>,
-            _options: ReplaceChildrenOptions,
-        ) -> DFResult<Arc<dyn ExecutionPlan>> {
-            Ok(self)
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
             self: Arc<Self>,
-            children: Vec<Arc<dyn ExecutionPlan>>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> DFResult<Arc<dyn ExecutionPlan>> {
-            self.replace_children(
-                children,
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
+            Ok(self)
         }
 
         fn execute(
@@ -540,32 +516,7 @@ mod tests {
         ]));
 
         // 4. Create IcebergWriteExec
-        let write_exec = Arc::new(IcebergWriteExec::new(table.clone(), input_plan));
-        assert_eq!(write_exec.schema(), IcebergWriteExec::make_result_schema());
-
-        let replacement_input =
-            Arc::new(MockExecutionPlan::new(arrow_schema, vec![])) as Arc<dyn ExecutionPlan>;
-        let original_properties = Arc::clone(write_exec.properties());
-        let kept_properties = Arc::clone(&write_exec)
-            .replace_children(
-                vec![Arc::clone(&replacement_input)],
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
-            )
-            .expect("replacing a write child with unchanged properties should succeed");
-        assert!(Arc::ptr_eq(
-            &original_properties,
-            kept_properties.properties()
-        ));
-        let recomputed_properties = Arc::clone(&write_exec)
-            .replace_children(
-                vec![replacement_input],
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
-            .expect("replacing a write child should succeed");
-        assert!(!Arc::ptr_eq(
-            &original_properties,
-            recomputed_properties.properties()
-        ));
+        let write_exec = IcebergWriteExec::new(table.clone(), input_plan);
 
         // 5. Execute the plan
         let task_ctx = Arc::new(TaskContext::default());
@@ -669,6 +620,33 @@ mod tests {
         // 7. Verify the file exists
         let file_io = table.file_io();
         assert!(file_io.exists(file_path).await?, "Data file should exist");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_advertises_result_schema() -> Result<()> {
+        let iceberg_catalog = get_iceberg_catalog().await;
+        let namespace = NamespaceIdent::new("test_namespace".to_string());
+        iceberg_catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await?;
+        let creation = get_table_creation(temp_path(), "test_table", get_test_schema()?);
+        let table = iceberg_catalog.create_table(&namespace, creation).await?;
+
+        let table_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let input = Arc::new(MockExecutionPlan::new(table_schema.clone(), vec![]));
+
+        let write_exec = IcebergWriteExec::new(table, input);
+
+        assert_eq!(
+            write_exec.schema().as_ref(),
+            &ArrowSchema::new(vec![Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false)]),
+            "IcebergWriteExec should advertise the data_files schema, not the table schema"
+        );
 
         Ok(())
     }
