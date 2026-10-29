@@ -253,7 +253,7 @@ impl FileWrite for RuntimeFileWrite {
         .await
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&mut self) -> Result<FileMetadata> {
         let inner = Arc::clone(&self.inner);
         spawn_on_io(&self.io_runtime, "closing file writer", async move {
             inner.lock().await.close().await

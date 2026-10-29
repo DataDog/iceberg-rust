@@ -64,10 +64,13 @@ fn check_avro_bytes_serde(input: Vec<u8>, expected_datum: Datum, expected_type: 
     let datum = Datum::try_from_bytes(&bytes, expected_type.clone()).unwrap();
     assert_eq!(datum, expected_datum);
 
-    let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).unwrap();
     writer.append_ser(datum.to_bytes().unwrap()).unwrap();
     let encoded = writer.into_inner().unwrap();
-    let reader = apache_avro::Reader::with_schema(&schema, &*encoded).unwrap();
+    let reader = apache_avro::Reader::builder(&*encoded)
+        .reader_schema(&schema)
+        .build()
+        .unwrap();
 
     for record in reader {
         let result = apache_avro::from_value::<ByteBuf>(&record.unwrap()).unwrap();
@@ -86,7 +89,7 @@ fn check_convert_with_avro(expected_literal: Literal, expected_type: &Type) {
     let struct_type = Type::Struct(StructType::new(fields));
     let struct_literal = Literal::Struct(Struct::from_iter(vec![Some(expected_literal.clone())]));
 
-    let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new()).unwrap();
     let raw_literal = RawLiteral::try_from(struct_literal.clone(), &struct_type).unwrap();
     writer.append_ser(raw_literal).unwrap();
     let encoded = writer.into_inner().unwrap();
@@ -110,7 +113,7 @@ fn check_serialize_avro(literal: Literal, ty: &Type, expect_value: Value) {
     let avro_schema = schema_to_avro_schema("test", &schema).unwrap();
     let struct_type = Type::Struct(StructType::new(fields));
     let struct_literal = Literal::Struct(Struct::from_iter(vec![Some(literal.clone())]));
-    let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new()).unwrap();
     let raw_literal = RawLiteral::try_from(struct_literal.clone(), &struct_type).unwrap();
     let value = to_value(raw_literal)
         .unwrap()
@@ -339,6 +342,23 @@ fn json_fixed() {
         record,
         Literal::Primitive(PrimitiveLiteral::Binary(vec![0, 1, 15, 255])),
         &Primitive(PrimitiveType::Fixed(4)),
+    );
+}
+
+#[test]
+fn json_unknown_only_accepts_null() {
+    let unknown = Primitive(PrimitiveType::Unknown);
+
+    assert_eq!(
+        Literal::try_from_json(JsonValue::Null, &unknown).unwrap(),
+        None
+    );
+    let error = Literal::try_from_json(serde_json::json!(1), &unknown).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error
+            .message()
+            .contains("Unknown type only supports null default values")
     );
 }
 
@@ -907,7 +927,7 @@ fn check_convert_with_avro_map(expected_literal: Literal, expected_type: &Type) 
     let struct_type = Type::Struct(StructType::new(fields));
     let struct_literal = Literal::Struct(Struct::from_iter(vec![Some(expected_literal.clone())]));
 
-    let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new());
+    let mut writer = apache_avro::Writer::new(&avro_schema, Vec::new()).unwrap();
     let raw_literal = RawLiteral::try_from(struct_literal.clone(), &struct_type).unwrap();
     writer.append_ser(raw_literal).unwrap();
     let encoded = writer.into_inner().unwrap();
@@ -1104,6 +1124,38 @@ fn test_parse_timestamptz() {
     assert!(
         value.is_err(),
         "Parse timestamptz with invalid input should fail!"
+    );
+}
+
+#[test]
+fn test_pre_epoch_timestamptz_formatting() {
+    assert_eq!(
+        Datum::timestamptz_micros(-1).to_string(),
+        "1969-12-31 23:59:59.999999 UTC"
+    );
+    assert_eq!(
+        Datum::timestamptz_nanos(-1).to_string(),
+        "1969-12-31 23:59:59.999999999 UTC"
+    );
+    assert_eq!(
+        Datum::timestamptz_micros(-1_500_000).to_string(),
+        "1969-12-31 23:59:58.500 UTC"
+    );
+
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999+00:00""#,
+        Literal::long(-1),
+        &Primitive(PrimitiveType::Timestamptz),
+    );
+    check_json_serde(
+        r#""1969-12-31T23:59:58.500+00:00""#,
+        Literal::long(-1_500_000),
+        &Primitive(PrimitiveType::Timestamptz),
+    );
+    check_json_serde(
+        r#""1969-12-31T23:59:59.999999999+00:00""#,
+        Literal::long(-1),
+        &Primitive(PrimitiveType::TimestamptzNs),
     );
 }
 
@@ -1669,4 +1721,61 @@ fn test_datum_to_decimal_rejects_scale_change() {
         err.to_string()
             .contains("Decimal scale conversion is not supported")
     );
+}
+
+#[test]
+fn test_raw_literal_project_by_name_reorders_and_fills_fields() {
+    let written = StructType::new(vec![
+        NestedField::required(1, "a", Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(2, "b", Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(3, "extra", Primitive(PrimitiveType::Int)).into(),
+    ]);
+    let raw = RawLiteral::try_from(
+        Literal::Struct(Struct::from_iter([
+            Some(Literal::int(1)),
+            Some(Literal::int(2)),
+            Some(Literal::int(3)),
+        ])),
+        &Type::Struct(written),
+    )
+    .unwrap();
+    let expected = StructType::new(vec![
+        NestedField::optional(4, "c", Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(2, "b", Primitive(PrimitiveType::Int)).into(),
+        NestedField::required(1, "a", Primitive(PrimitiveType::Int)).into(),
+    ]);
+
+    let projected = raw
+        .project_by_name(&expected)
+        .unwrap()
+        .try_into(&Type::Struct(expected))
+        .unwrap();
+
+    assert_eq!(
+        projected,
+        Some(Literal::Struct(Struct::from_iter([
+            None,
+            Some(Literal::int(2)),
+            Some(Literal::int(1)),
+        ])))
+    );
+}
+
+#[test]
+fn test_raw_literal_project_by_name_rejects_missing_required_field() {
+    let written = StructType::new(vec![
+        NestedField::optional(1, "a", Primitive(PrimitiveType::Int)).into(),
+    ]);
+    let raw = RawLiteral::try_from(
+        Literal::Struct(Struct::from_iter([Some(Literal::int(1))])),
+        &Type::Struct(written),
+    )
+    .unwrap();
+    let expected = StructType::new(vec![
+        NestedField::optional(1, "a", Primitive(PrimitiveType::Int)).into(),
+        NestedField::required(2, "b", Primitive(PrimitiveType::Int)).into(),
+    ]);
+
+    let err = raw.project_by_name(&expected).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
 }
