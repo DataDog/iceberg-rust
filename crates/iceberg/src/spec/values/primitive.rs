@@ -19,6 +19,8 @@
 
 use ordered_float::OrderedFloat;
 
+use crate::spec::PrimitiveType;
+
 /// Values present in iceberg type
 #[derive(Clone, Debug, PartialOrd, PartialEq, Hash, Eq)]
 pub enum PrimitiveLiteral {
@@ -47,6 +49,29 @@ pub enum PrimitiveLiteral {
 }
 
 impl PrimitiveLiteral {
+    /// Widens this literal to its promotion ceiling (`int` -> `long`, `float` ->
+    /// `double`), returning `None` for any other literal. Used when the target type
+    /// is unknown (the partition source column was dropped) so a value and its
+    /// deletes still normalize to the same type.
+    pub(crate) fn widen(&self) -> Option<PrimitiveLiteral> {
+        match self {
+            PrimitiveLiteral::Int(value) => Some(PrimitiveLiteral::Long(i64::from(*value))),
+            PrimitiveLiteral::Float(value) => {
+                Some(PrimitiveLiteral::Double(OrderedFloat(f64::from(value.0))))
+            }
+            _ => None,
+        }
+    }
+
+    /// Widens this literal to `target` for the value promotions `int` -> `long`
+    /// and `float` -> `double`, returning `None` when `target` does not promote it.
+    pub(crate) fn promote_to(&self, target: &PrimitiveType) -> Option<PrimitiveLiteral> {
+        match (self, target) {
+            (PrimitiveLiteral::Int(_), PrimitiveType::Long)
+            | (PrimitiveLiteral::Float(_), PrimitiveType::Double) => self.widen(),
+            _ => None,
+        }
+    }
     /// Returns true if the Literal represents a primitive type
     /// that can be a NaN, and that it's value is NaN
     pub fn is_nan(&self) -> bool {
