@@ -269,6 +269,14 @@ impl FileScanTask {
         self.column_stats.as_deref()
     }
 
+    /// Removes and returns the data file's column statistics, leaving the task without any.
+    ///
+    /// Callers that have consumed the statistics can use this to avoid serializing them
+    /// when the task is sent to another process.
+    pub fn take_column_stats(&mut self) -> Option<FileScanTaskColumnStats> {
+        self.column_stats.take().map(|stats| *stats)
+    }
+
     /// Returns whether names are treated as case-sensitive.
     pub fn case_sensitive(&self) -> bool {
         self.case_sensitive

@@ -1351,6 +1351,7 @@ pub fn iceberg::scan::FileScanTask::schema_ref(&self) -> iceberg::spec::SchemaRe
 pub fn iceberg::scan::FileScanTask::sort_order(&self) -> core::option::Option<&iceberg::spec::SortOrderRef>
 pub fn iceberg::scan::FileScanTask::sort_order_id(&self) -> core::option::Option<i32>
 pub fn iceberg::scan::FileScanTask::start(&self) -> u64
+pub fn iceberg::scan::FileScanTask::take_column_stats(&mut self) -> core::option::Option<iceberg::scan::FileScanTaskColumnStats>
 pub fn iceberg::scan::FileScanTask::unified_partition_type(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::spec::StructType>>
 impl core::clone::Clone for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::clone(&self) -> iceberg::scan::FileScanTask
