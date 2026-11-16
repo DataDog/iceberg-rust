@@ -2390,8 +2390,8 @@ mod tests {
             Arc::new(UInt32Array::from(mixed)),
         ])?;
 
-        let page_index = metadata.page_index_for_row_group(0);
-        let column_index = page_index.column_index(0).unwrap();
+        let (column_indexes, _, _) = get_test_metadata(&metadata);
+        let column_index = &column_indexes[0];
         let parquet::file::page_index::column_index::ColumnIndexMetaData::INT32(idx) = column_index
         else {
             panic!("expected INT32 column index, got {column_index:?}");
@@ -2438,7 +2438,7 @@ mod tests {
         row_count: usize,
         filters: impl IntoIterator<Item = Predicate>,
     ) -> Result<()> {
-        let (page_index, row_group_metadata) = get_test_metadata(metadata);
+        let (column_index, offset_index, row_group_metadata) = get_test_metadata(metadata);
         let (iceberg_schema, field_id_map) = build_single_field_schema_and_field_map(field_type)?;
 
         for filter in filters {
@@ -2446,7 +2446,8 @@ mod tests {
 
             let result = PageIndexEvaluator::eval(
                 &filter,
-                &page_index,
+                &column_index,
+                &offset_index,
                 row_group_metadata,
                 &field_id_map,
                 iceberg_schema.as_ref(),
