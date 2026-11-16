@@ -23,6 +23,8 @@ use arrow_schema::{DataType, TimeUnit};
 use super::TransformFunction;
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
 
+const NANOSECONDS_PER_MICROSECOND: i64 = 1_000;
+
 #[derive(Debug)]
 pub struct Bucket {
     mod_n: u32,
@@ -78,12 +80,26 @@ impl Bucket {
     /// ref: https://iceberg.apache.org/spec/#appendix-b-32-bit-hash-requirements
     #[inline]
     fn hash_decimal(v: i128) -> i32 {
-        let bytes = v.to_be_bytes();
-        if let Some(start) = bytes.iter().position(|&x| x != 0) {
-            Self::hash_bytes(&bytes[start..])
-        } else {
-            Self::hash_bytes(&[0])
+        if v == 0 {
+            return Self::hash_bytes(&[0]);
         }
+
+        let bytes = v.to_be_bytes();
+        let start = if v > 0 {
+            // Positive: skip 0x00 unless next byte would appear negative
+            bytes
+                .windows(2)
+                .position(|w| w[0] != 0x00 || w[1] & 0x80 != 0)
+                .unwrap_or(15)
+        } else {
+            // Negative: skip 0xFF only if next byte stays negative
+            bytes
+                .windows(2)
+                .position(|w| w[0] != 0xFF || w[1] & 0x80 == 0)
+                .unwrap_or(15)
+        };
+
+        Self::hash_bytes(&bytes[start..])
     }
 
     /// def bucket_N(x) = (murmur3_x86_32_hash(x) & Integer.MAX_VALUE) % N
@@ -132,6 +148,11 @@ impl Bucket {
     fn bucket_bytes(&self, v: &[u8]) -> i32 {
         self.bucket_n(Self::hash_bytes(v))
     }
+
+    #[inline]
+    fn nanos_to_micros(v: i64) -> i64 {
+        v.div_euclid(NANOSECONDS_PER_MICROSECOND)
+    }
 }
 
 impl TransformFunction for Bucket {
@@ -171,12 +192,12 @@ impl TransformFunction for Bucket {
                 .as_any()
                 .downcast_ref::<arrow_array::Time64NanosecondArray>()
                 .unwrap()
-                .unary(|v| self.bucket_time(v / 1000)),
+                .unary(|v| self.bucket_time(Self::nanos_to_micros(v))),
             DataType::Timestamp(TimeUnit::Nanosecond, _) => input
                 .as_any()
                 .downcast_ref::<arrow_array::TimestampNanosecondArray>()
                 .unwrap()
-                .unary(|v| self.bucket_timestamp(v / 1000)),
+                .unary(|v| self.bucket_timestamp(Self::nanos_to_micros(v))),
             DataType::Utf8 => arrow_array::Int32Array::from_iter(
                 input
                     .as_any()
@@ -240,10 +261,10 @@ impl TransformFunction for Bucket {
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => self.bucket_timestamp(*v),
             (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(v)) => self.bucket_timestamp(*v),
             (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(v)) => {
-                self.bucket_timestamp(*v / 1000)
+                self.bucket_timestamp(Self::nanos_to_micros(*v))
             }
             (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
-                self.bucket_timestamp(*v / 1000)
+                self.bucket_timestamp(Self::nanos_to_micros(*v))
             }
             (PrimitiveType::String, PrimitiveLiteral::String(v)) => self.bucket_str(v.as_str()),
             (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(v)) => {
@@ -276,11 +297,12 @@ mod test {
     use crate::Result;
     use crate::expr::PredicateOperator;
     use crate::spec::PrimitiveType::{
-        Binary, Date, Decimal, Fixed, Int, Long, String as StringType, Time, Timestamp,
+        Binary, Date, Decimal, Fixed, Geometry, Int, Long, String as StringType, Time, Timestamp,
         TimestampNs, Timestamptz, TimestamptzNs, Uuid,
     };
     use crate::spec::Type::{Primitive, Struct};
-    use crate::spec::{Datum, NestedField, PrimitiveType, StructType, Transform, Type};
+    use crate::spec::decimal_utils::decimal_new;
+    use crate::spec::{Datum, GeometryType, NestedField, PrimitiveType, StructType, Transform};
     use crate::transform::TransformFunction;
     use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
 
@@ -319,6 +341,7 @@ mod test {
                 (Primitive(Timestamptz), Some(Primitive(Int))),
                 (Primitive(TimestampNs), Some(Primitive(Int))),
                 (Primitive(TimestamptzNs), Some(Primitive(Int))),
+                (Primitive(Geometry(GeometryType::default())), None),
                 (
                     Struct(StructType::new(vec![
                         NestedField::optional(1, "a", Primitive(Timestamp)).into(),
@@ -339,7 +362,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Bucket(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Uuid)),
+            NestedField::required(1, "value", Primitive(Uuid)),
         );
 
         fixture.assert_projection(
@@ -399,11 +422,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Bucket(10),
             "name",
-            NestedField::required(
-                1,
-                "value",
-                Type::Primitive(PrimitiveType::Fixed(value.len() as u64)),
-            ),
+            NestedField::required(1, "value", Primitive(Fixed(value.len() as u64))),
         );
 
         fixture.assert_projection(
@@ -466,7 +485,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Bucket(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::String)),
+            NestedField::required(1, "value", Primitive(PrimitiveType::String)),
         );
 
         fixture.assert_projection(
@@ -530,7 +549,7 @@ mod test {
             NestedField::required(
                 1,
                 "value",
-                Type::Primitive(PrimitiveType::Decimal {
+                Primitive(Decimal {
                     precision: 9,
                     scale: 2,
                 }),
@@ -602,7 +621,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Bucket(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Long)),
+            NestedField::required(1, "value", Primitive(Long)),
         );
 
         fixture.assert_projection(
@@ -662,7 +681,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Bucket(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Int)),
+            NestedField::required(1, "value", Primitive(Int)),
         );
 
         fixture.assert_projection(
@@ -791,6 +810,27 @@ mod test {
     }
 
     #[test]
+    fn test_hash_decimal_with_negative_value() {
+        // Test cases from GitHub issue #1981
+        assert_eq!(Bucket::hash_decimal(1), -463810133);
+        assert_eq!(Bucket::hash_decimal(-1), -43192051);
+
+        // Additional test cases for edge case values
+        assert_eq!(Bucket::hash_decimal(0), Bucket::hash_decimal(0));
+        assert_eq!(Bucket::hash_decimal(127), Bucket::hash_decimal(127));
+        assert_eq!(Bucket::hash_decimal(-128), Bucket::hash_decimal(-128));
+
+        // Test minimum representation is used
+        // -1 should hash as [0xFF] not [0xFF, 0xFF, ..., 0xFF]
+        // 128 should hash as [0x00, 0x80] not [0x00, 0x00, ..., 0x80]
+        assert_eq!(Bucket::hash_decimal(128), Bucket::hash_bytes(&[0x00, 0x80]));
+        assert_eq!(
+            Bucket::hash_decimal(-129),
+            Bucket::hash_bytes(&[0xFF, 0x7F])
+        );
+    }
+
+    #[test]
     fn test_int_literal() {
         let bucket = Bucket::new(10);
         assert_eq!(
@@ -813,7 +853,7 @@ mod test {
         let bucket = Bucket::new(10);
         assert_eq!(
             bucket
-                .transform_literal(&Datum::decimal(1420).unwrap())
+                .transform_literal(&Datum::decimal(decimal_new(1420, 0)).unwrap())
                 .unwrap()
                 .unwrap(),
             Datum::int(9)
@@ -966,5 +1006,47 @@ mod test {
             .unwrap();
 
         assert_eq!(micro_result.value(0), nano_result.value(0));
+    }
+
+    #[test]
+    fn test_nanos_to_micros_uses_floor_division() {
+        assert_eq!(Bucket::nanos_to_micros(i64::MIN), -9_223_372_036_854_776);
+        assert_eq!(Bucket::nanos_to_micros(1_001), 1);
+        assert_eq!(Bucket::nanos_to_micros(1_000), 1);
+        assert_eq!(Bucket::nanos_to_micros(0), 0);
+        assert_eq!(Bucket::nanos_to_micros(-1_000), -1);
+        assert_eq!(Bucket::nanos_to_micros(-1_001), -2);
+        assert_eq!(Bucket::nanos_to_micros(i64::MAX), 9_223_372_036_854_775);
+    }
+
+    #[test]
+    fn test_negative_timestamp_nanos_round_down_to_micros() {
+        let bucket = Bucket::new(100);
+        let micros_value = -1_510_871_468_000_001;
+        let nanos_value = micros_value * 1000 + 999;
+
+        let expected = bucket
+            .transform_literal(&Datum::timestamp_micros(micros_value))
+            .unwrap();
+        assert_eq!(
+            bucket
+                .transform_literal(&Datum::timestamp_nanos(nanos_value))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            bucket
+                .transform_literal(&Datum::timestamptz_nanos(nanos_value))
+                .unwrap(),
+            expected
+        );
+
+        let micro_array = TimestampMicrosecondArray::from_iter_values([micros_value]);
+        let nano_array = TimestampNanosecondArray::from_iter_values([nanos_value]);
+        let micro_result = bucket.transform(Arc::new(micro_array)).unwrap();
+        let nano_result = bucket.transform(Arc::new(nano_array)).unwrap();
+        let micro_result = micro_result.as_any().downcast_ref::<Int32Array>().unwrap();
+        let nano_result = nano_result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(micro_result, nano_result);
     }
 }

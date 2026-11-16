@@ -17,25 +17,27 @@
 
 use fnv::FnvHashSet;
 
+use super::scalar_bound;
+use crate::Result;
+use crate::error::invalid_data;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{DataFile, Datum};
-use crate::{Error, ErrorKind, Result};
 
 #[allow(dead_code)]
 const ROWS_MUST_MATCH: Result<bool> = Ok(true);
 #[allow(dead_code)]
 const ROWS_MIGHT_NOT_MATCH: Result<bool> = Ok(false);
 
-#[allow(dead_code)]
 /// Evaluates an `Expression` on a `DataFile` to test whether all rows in the file match.
-///  
+///
 /// This evaluation is strict: it returns true if all rows in a file must match the expression.
 /// For example, if a file's ts column has min X and max Y, this evaluator will return true for ts
 /// &lt; Y+1 but not for ts &lt; Y-1.
 ///
 /// Files are passed to `eval(DataFile)`, which returns true if all rows in the file
 /// must contain matching rows and false if the file may contain rows that do not match.
+#[allow(dead_code)]
 pub(crate) struct StrictMetricsEvaluator<'a> {
     data_file: &'a DataFile,
 }
@@ -51,7 +53,7 @@ impl<'a> StrictMetricsEvaluator<'a> {
     /// see if this `DataFile` contains data that could match
     /// the scan's filter.
     #[allow(dead_code)]
-    pub(crate) fn eval(filter: &'a BoundPredicate, data_file: &'a DataFile) -> crate::Result<bool> {
+    pub(crate) fn eval(filter: &'a BoundPredicate, data_file: &'a DataFile) -> Result<bool> {
         if data_file.record_count == 0 {
             return ROWS_MUST_MATCH;
         }
@@ -73,11 +75,11 @@ impl<'a> StrictMetricsEvaluator<'a> {
     }
 
     fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.lower_bounds.get(&field_id)
+        scalar_bound(self.data_file.lower_bounds.get(&field_id))
     }
 
     fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.upper_bounds.get(&field_id)
+        scalar_bound(self.data_file.upper_bounds.get(&field_id))
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {
@@ -116,7 +118,7 @@ impl<'a> StrictMetricsEvaluator<'a> {
         datum: &Datum,
         cmp_fn: fn(&Datum, &Datum) -> bool,
         use_lower_bound: bool,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
         if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
@@ -129,10 +131,10 @@ impl<'a> StrictMetricsEvaluator<'a> {
             self.upper_bound(field_id)
         };
 
-        if let Some(bound) = bound {
-            if cmp_fn(bound, datum) {
-                return ROWS_MUST_MATCH;
-            }
+        if let Some(bound) = bound
+            && cmp_fn(bound, datum)
+        {
+            return ROWS_MUST_MATCH;
         }
 
         ROWS_MIGHT_NOT_MATCH
@@ -142,34 +144,27 @@ impl<'a> StrictMetricsEvaluator<'a> {
 impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     type T = bool;
 
-    fn always_true(&mut self) -> crate::Result<bool> {
+    fn always_true(&mut self) -> Result<bool> {
         ROWS_MUST_MATCH
     }
 
-    fn always_false(&mut self) -> crate::Result<bool> {
+    fn always_false(&mut self) -> Result<bool> {
         ROWS_MIGHT_NOT_MATCH
     }
 
-    fn and(&mut self, lhs: bool, rhs: bool) -> crate::Result<bool> {
+    fn and(&mut self, lhs: bool, rhs: bool) -> Result<bool> {
         Ok(lhs && rhs)
     }
 
-    fn or(&mut self, lhs: bool, rhs: bool) -> crate::Result<bool> {
+    fn or(&mut self, lhs: bool, rhs: bool) -> Result<bool> {
         Ok(lhs || rhs)
     }
 
-    fn not(&mut self, _inner: bool) -> crate::Result<bool> {
-        Err(Error::new(
-            ErrorKind::DataInvalid,
-            "NOT should be rewritten",
-        ))
+    fn not(&mut self, _inner: bool) -> Result<bool> {
+        Err(invalid_data!("NOT should be rewritten"))
     }
 
-    fn is_null(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    fn is_null(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
         let field_id = reference.field().id;
 
         if self.contains_nulls_only(field_id) {
@@ -183,7 +178,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         &mut self,
         reference: &BoundReference,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
         if let Some(&count) = self.null_count(field_id) {
@@ -196,11 +191,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         ROWS_MIGHT_NOT_MATCH
     }
 
-    fn is_nan(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    fn is_nan(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
         let field_id = reference.field().id;
 
         let contains_only = self.contains_nans_only(field_id);
@@ -212,17 +203,13 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         ROWS_MIGHT_NOT_MATCH
     }
 
-    fn not_nan(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    fn not_nan(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
         let field_id = reference.field().id;
 
-        if let Some(&nan_count) = self.nan_count(field_id) {
-            if nan_count == 0 {
-                return ROWS_MUST_MATCH;
-            }
+        if let Some(&nan_count) = self.nan_count(field_id)
+            && nan_count == 0
+        {
+            return ROWS_MUST_MATCH;
         }
 
         if self.contains_nulls_only(field_id) {
@@ -237,7 +224,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         self.visit_inequality(reference, datum, PartialOrd::lt, false)
     }
 
@@ -246,7 +233,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         self.visit_inequality(reference, datum, PartialOrd::le, false)
     }
 
@@ -255,13 +242,13 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
-        if let Some(lower) = self.lower_bound(field_id) {
-            if lower.is_nan() {
-                return ROWS_MIGHT_NOT_MATCH;
-            }
+        if let Some(lower) = self.lower_bound(field_id)
+            && lower.is_nan()
+        {
+            return ROWS_MIGHT_NOT_MATCH;
         }
 
         self.visit_inequality(reference, datum, PartialOrd::gt, true)
@@ -272,7 +259,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         self.visit_inequality(reference, datum, PartialOrd::ge, true)
     }
 
@@ -281,7 +268,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
         if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
@@ -307,7 +294,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
         if self.contains_nulls_only(field_id) || self.contains_nans_only(field_id) {
@@ -340,7 +327,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         _reference: &BoundReference,
         _datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         ROWS_MIGHT_NOT_MATCH
     }
 
@@ -349,7 +336,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         _reference: &BoundReference,
         _datum: &Datum,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         ROWS_MIGHT_NOT_MATCH
     }
 
@@ -358,7 +345,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
         if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
@@ -382,7 +369,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
-    ) -> crate::Result<bool> {
+    ) -> Result<bool> {
         let field_id = reference.field().id;
 
         if self.contains_nulls_only(field_id) || self.contains_nans_only(field_id) {
@@ -578,7 +565,7 @@ mod test {
             ]),
             column_sizes: Default::default(),
             key_metadata: None,
-            split_offsets: vec![],
+            split_offsets: None,
             equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
@@ -604,7 +591,7 @@ mod test {
             lower_bounds: Default::default(),
             upper_bounds: Default::default(),
             key_metadata: None,
-            split_offsets: vec![],
+            split_offsets: None,
             equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
@@ -630,7 +617,7 @@ mod test {
             upper_bounds: HashMap::from([(1, Datum::int(42))]),
             column_sizes: Default::default(),
             key_metadata: None,
-            split_offsets: vec![],
+            split_offsets: None,
             equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
@@ -657,7 +644,7 @@ mod test {
             upper_bounds: HashMap::from([(3, Datum::string("dC"))]),
             column_sizes: Default::default(),
             key_metadata: None,
-            split_offsets: vec![],
+            split_offsets: None,
             equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
@@ -1045,8 +1032,7 @@ mod test {
             // For zero-record files, strict eval returns MUST_MATCH.
             assert!(
                 result,
-                "Strict eval: Should read zero-record file for expression {:?}",
-                expr
+                "Strict eval: Should read zero-record file for expression {expr:?}"
             );
         }
     }
@@ -1142,11 +1128,7 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MIN_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id < {} should be false",
-            INT_MIN_VALUE
-        );
+        assert!(!result, "Strict eval: id < {INT_MIN_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MIN_VALUE + 1), &file).unwrap();
@@ -1158,11 +1140,7 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MAX_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id < {} should be false",
-            INT_MAX_VALUE
-        );
+        assert!(!result, "Strict eval: id < {INT_MAX_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MAX_VALUE + 1), &file).unwrap();
@@ -1200,18 +1178,13 @@ mod test {
                 .unwrap();
         assert!(
             !result,
-            "Strict eval: id <= {} should be false",
-            INT_MIN_VALUE
+            "Strict eval: id <= {INT_MIN_VALUE} should be false"
         );
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_or_equal_int("id", INT_MAX_VALUE), &file)
                 .unwrap();
-        assert!(
-            result,
-            "Strict eval: id <= {} should be true",
-            INT_MAX_VALUE
-        );
+        assert!(result, "Strict eval: id <= {INT_MAX_VALUE} should be true");
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_or_equal_int("id", INT_MAX_VALUE + 1), &file)
@@ -1238,19 +1211,11 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MAX_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id > {} should be false",
-            INT_MAX_VALUE
-        );
+        assert!(!result, "Strict eval: id > {INT_MAX_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MIN_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id > {} should be false",
-            INT_MIN_VALUE
-        );
+        assert!(!result, "Strict eval: id > {INT_MIN_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MIN_VALUE - 1), &file)
@@ -1302,18 +1267,13 @@ mod test {
                 .unwrap();
         assert!(
             !result,
-            "Strict eval: id >= {} should be false",
-            INT_MAX_VALUE
+            "Strict eval: id >= {INT_MAX_VALUE} should be false"
         );
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_or_equal_int("id", INT_MIN_VALUE), &file)
                 .unwrap();
-        assert!(
-            result,
-            "Strict eval: id >= {} should be true",
-            INT_MIN_VALUE
-        );
+        assert!(result, "Strict eval: id >= {INT_MIN_VALUE} should be true");
 
         let result = StrictMetricsEvaluator::eval(
             &greater_than_or_equal_int("id", INT_MIN_VALUE - 1),

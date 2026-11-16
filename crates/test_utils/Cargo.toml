@@ -19,6 +19,7 @@
 edition = { workspace = true }
 homepage = { workspace = true }
 name = "iceberg_test_utils"
+publish = false
 rust-version = { workspace = true }
 version = { workspace = true }
 
@@ -26,8 +27,12 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [dependencies]
-tracing = { workspace = true }
+iceberg = { workspace = true }
+tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [features]
 tests = []
+
+[lints]
+workspace = true

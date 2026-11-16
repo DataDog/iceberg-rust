@@ -27,7 +27,7 @@ use fnv::FnvHashSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::visit as visit_bound;
 use crate::expr::visitors::predicate_visitor::visit;
 use crate::expr::visitors::rewrite_not::RewriteNotVisitor;
@@ -53,8 +53,8 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for LogicalExpre
     where D: serde::Deserializer<'de> {
         let inputs = Vec::<Box<T>>::deserialize(deserializer)?;
         Ok(LogicalExpression::new(
-            array_init::from_iter(inputs.into_iter()).ok_or_else(|| {
-                serde::de::Error::custom(format!("Failed to deserialize LogicalExpression: the len of inputs is not match with the len of LogicalExpression {}",N))
+            array_init::from_iter(inputs).ok_or_else(|| {
+                serde::de::Error::custom(format!("Failed to deserialize LogicalExpression: the len of inputs is not match with the len of LogicalExpression {N}"))
             })?,
         ))
     }
@@ -310,7 +310,7 @@ impl<T: Bind> Bind for SetExpression<T> {
 
 impl<T: Display + Debug> Display for SetExpression<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut literal_strs = self.literals.iter().map(|l| format!("{}", l));
+        let mut literal_strs = self.literals.iter().map(|l| format!("{l}"));
 
         write!(f, "{} {} ({})", self.term, self.op, literal_strs.join(", "))
     }
@@ -398,12 +398,9 @@ impl Bind for Predicate {
                     }
                     &PredicateOperator::IsNan | &PredicateOperator::NotNan => {
                         if !bound_expr.term.field().field_type.is_floating_type() {
-                            return Err(Error::new(
-                                ErrorKind::DataInvalid,
-                                format!(
-                                    "Expecting floating point type, but found {}",
-                                    bound_expr.term.field().field_type
-                                ),
+                            return Err(invalid_data!(
+                                "Expecting floating point type, but found {}",
+                                bound_expr.term.field().field_type
                             ));
                         }
                     }
@@ -529,13 +526,13 @@ impl Display for Predicate {
                 write!(f, "NOT ({})", expr.inputs()[0])
             }
             Predicate::Unary(expr) => {
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
             Predicate::Binary(expr) => {
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
             Predicate::Set(expr) => {
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
         }
     }
@@ -805,13 +802,13 @@ impl Display for BoundPredicate {
                 write!(f, "NOT ({})", expr.inputs()[0])
             }
             BoundPredicate::Unary(expr) => {
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
             BoundPredicate::Binary(expr) => {
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
             BoundPredicate::Set(expr) => {
-                write!(f, "{}", expr)
+                write!(f, "{expr}")
             }
         }
     }

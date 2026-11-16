@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Array, ArrayData, make_array};
+use arrow::array::{ArrayData, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use iceberg::spec::Transform;
 use iceberg::transform::create_transform_function;
@@ -24,54 +24,54 @@ use pyo3::prelude::*;
 use crate::error::to_py_err;
 
 #[pyfunction]
-pub fn identity(py: Python, array: PyObject) -> PyResult<PyObject> {
+pub fn identity(py: Python, array: Py<PyAny>) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Identity)
 }
 
 #[pyfunction]
-pub fn void(py: Python, array: PyObject) -> PyResult<PyObject> {
+pub fn void(py: Python, array: Py<PyAny>) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Void)
 }
 
 #[pyfunction]
-pub fn year(py: Python, array: PyObject) -> PyResult<PyObject> {
+pub fn year(py: Python, array: Py<PyAny>) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Year)
 }
 
 #[pyfunction]
-pub fn month(py: Python, array: PyObject) -> PyResult<PyObject> {
+pub fn month(py: Python, array: Py<PyAny>) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Month)
 }
 
 #[pyfunction]
-pub fn day(py: Python, array: PyObject) -> PyResult<PyObject> {
+pub fn day(py: Python, array: Py<PyAny>) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Day)
 }
 
 #[pyfunction]
-pub fn hour(py: Python, array: PyObject) -> PyResult<PyObject> {
+pub fn hour(py: Python, array: Py<PyAny>) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Hour)
 }
 
 #[pyfunction]
-pub fn bucket(py: Python, array: PyObject, num_buckets: u32) -> PyResult<PyObject> {
+pub fn bucket(py: Python, array: Py<PyAny>, num_buckets: u32) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Bucket(num_buckets))
 }
 
 #[pyfunction]
-pub fn truncate(py: Python, array: PyObject, width: u32) -> PyResult<PyObject> {
+pub fn truncate(py: Python, array: Py<PyAny>, width: u32) -> PyResult<Py<PyAny>> {
     apply(py, array, Transform::Truncate(width))
 }
 
-fn apply(py: Python, array: PyObject, transform: Transform) -> PyResult<PyObject> {
+fn apply(py: Python, array: Py<PyAny>, transform: Transform) -> PyResult<Py<PyAny>> {
     // import
     let array = ArrayData::from_pyarrow_bound(array.bind(py))?;
     let array = make_array(array);
     let transform_function = create_transform_function(&transform).map_err(to_py_err)?;
     let array = transform_function.transform(array).map_err(to_py_err)?;
     // export
-    let array = array.into_data();
-    array.to_pyarrow(py)
+    let array = array.to_data();
+    Ok(array.to_pyarrow(py)?.unbind())
 }
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

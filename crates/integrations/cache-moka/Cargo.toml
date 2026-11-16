@@ -18,13 +18,21 @@
 [package]
 name = "iceberg-cache-moka"
 
+categories = ["caching"]
+description = "Apache Iceberg Moka cache implementation"
+keywords = ["iceberg", "cache", "moka"]
+
 edition = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
+publish = true
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
 iceberg = { workspace = true }
-moka = { version = "0.12.10", features = ["sync"] }
+moka = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

@@ -19,6 +19,7 @@
 
 mod datatypes;
 mod encrypted_key;
+pub mod geospatial;
 mod manifest;
 mod manifest_list;
 mod name_mapping;
@@ -30,6 +31,7 @@ mod sort;
 mod statistic_file;
 mod table_metadata;
 mod table_metadata_builder;
+mod table_properties;
 mod transform;
 mod values;
 mod view_metadata;
@@ -38,6 +40,7 @@ mod view_version;
 
 pub use datatypes::*;
 pub use encrypted_key::*;
+pub use geospatial::{GeographyType, GeometryType};
 pub use manifest::*;
 pub use manifest_list::*;
 pub use name_mapping::*;
@@ -48,7 +51,10 @@ pub use snapshot_summary::*;
 pub use sort::*;
 pub use statistic_file::*;
 pub use table_metadata::*;
+pub(crate) use table_metadata_builder::FIRST_FIELD_ID;
+pub use table_properties::*;
 pub use transform::*;
+pub(crate) use values::decimal_utils;
 pub use values::*;
 pub use view_metadata::*;
 pub use view_version::*;

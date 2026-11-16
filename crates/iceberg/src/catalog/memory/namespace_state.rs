@@ -19,6 +19,7 @@ use std::collections::{HashMap, hash_map};
 
 use itertools::Itertools;
 
+use crate::error::invalid_data;
 use crate::table::Table;
 use crate::{Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 
@@ -36,34 +37,28 @@ pub(crate) struct NamespaceState {
 fn no_such_namespace_err<T>(namespace_ident: &NamespaceIdent) -> Result<T> {
     Err(Error::new(
         ErrorKind::NamespaceNotFound,
-        format!("No such namespace: {:?}", namespace_ident),
+        format!("No such namespace: {namespace_ident:?}"),
     ))
 }
 
 fn no_such_table_err<T>(table_ident: &TableIdent) -> Result<T> {
     Err(Error::new(
         ErrorKind::TableNotFound,
-        format!("No such table: {:?}", table_ident),
+        format!("No such table: {table_ident:?}"),
     ))
 }
 
 fn namespace_already_exists_err<T>(namespace_ident: &NamespaceIdent) -> Result<T> {
     Err(Error::new(
         ErrorKind::NamespaceAlreadyExists,
-        format!(
-            "Cannot create namespace {:?}. Namespace already exists.",
-            namespace_ident
-        ),
+        format!("Cannot create namespace {namespace_ident:?}. Namespace already exists."),
     ))
 }
 
 fn table_already_exists_err<T>(table_ident: &TableIdent) -> Result<T> {
     Err(Error::new(
         ErrorKind::TableAlreadyExists,
-        format!(
-            "Cannot create table {:?}. Table already exists.",
-            table_ident
-        ),
+        format!("Cannot create table {table_ident:?}. Table already exists."),
     ))
 }
 
@@ -117,10 +112,7 @@ impl NamespaceState {
         namespace_ident: &NamespaceIdent,
     ) -> Result<(&mut NamespaceState, String)> {
         match namespace_ident.split_last() {
-            None => Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Namespace identifier can't be empty!",
-            )),
+            None => Err(invalid_data!("Namespace identifier can't be empty!")),
             Some((child_namespace_name, parent_name_parts)) => {
                 let parent_namespace_state = if parent_name_parts.is_empty() {
                     Ok(self)

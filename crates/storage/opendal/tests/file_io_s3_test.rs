@@ -1,0 +1,418 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Integration tests for FileIO S3.
+//!
+//! These tests assume Docker containers are started externally via `make docker-up`.
+//! Each test uses unique file paths based on module path to avoid conflicts.
+#[cfg(feature = "opendal-s3")]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use iceberg::io::{
+        FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_MULTIPART_PART_SIZE_BYTES,
+        S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+    };
+    use iceberg_storage_opendal::{
+        AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
+    };
+    use iceberg_test_utils::{get_object_store_endpoint, normalize_test_name_with_parts, set_up};
+    use opendal::Configurator;
+    use reqsign_core::Context;
+
+    const OBJECT_STORE_ACCESS_KEY_ID: &str = "admin";
+    const OBJECT_STORE_SECRET_ACCESS_KEY: &str = "password";
+    const OBJECT_STORE_REGION: &str = "us-east-1";
+    const OBJECT_STORE_BUCKET: &str = "bucket1";
+
+    async fn get_file_io() -> FileIO {
+        get_file_io_with_props(vec![]).await
+    }
+
+    async fn get_file_io_with_props(extra: Vec<(&'static str, String)>) -> FileIO {
+        set_up();
+
+        let object_store_endpoint = get_object_store_endpoint();
+
+        let mut props = vec![
+            (S3_ENDPOINT, object_store_endpoint),
+            (S3_ACCESS_KEY_ID, OBJECT_STORE_ACCESS_KEY_ID.to_string()),
+            (
+                S3_SECRET_ACCESS_KEY,
+                OBJECT_STORE_SECRET_ACCESS_KEY.to_string(),
+            ),
+            (S3_REGION, OBJECT_STORE_REGION.to_string()),
+            (S3_PATH_STYLE_ACCESS, "true".to_string()),
+        ];
+        props.extend(extra);
+
+        FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
+        .with_props(props)
+        .build()
+    }
+
+    /// Number of upload parts S3 recorded for `key`. A multipart upload reports
+    /// a `<md5>-<part-count>` ETag; a single-request upload reports a bare MD5.
+    ///
+    /// A server-side encrypted object can report an ETag without the suffix, so
+    /// this helper holds only for the object store fixture these tests run against.
+    async fn upload_part_count(key: &str) -> usize {
+        let mut config = opendal::services::S3Config::default();
+        config.endpoint = Some(get_object_store_endpoint());
+        config.access_key_id = Some(OBJECT_STORE_ACCESS_KEY_ID.to_string());
+        config.secret_access_key = Some(OBJECT_STORE_SECRET_ACCESS_KEY.to_string());
+        config.region = Some(OBJECT_STORE_REGION.to_string());
+        config.bucket = OBJECT_STORE_BUCKET.to_string();
+        // Each `#[tokio::test]` has its own runtime, and the first request after
+        // an earlier one went away fails before the client reconnects. The
+        // storage under test carries the same layer.
+        let op = opendal::Operator::new(config.into_builder())
+            .unwrap()
+            .layer(opendal::layers::RetryLayer::new());
+        let meta = op.stat(key).await.unwrap();
+        let etag = meta
+            .etag()
+            .expect("object store reports an ETag")
+            .trim_matches('"');
+        match etag.rsplit_once('-') {
+            Some((_, parts)) => parts
+                .parse()
+                .unwrap_or_else(|e| panic!("unexpected ETag format {etag}: {e}")),
+            None => 1,
+        }
+    }
+
+    fn roundtrip_file_io(file_io: &FileIO) -> FileIO {
+        let serialized = file_io.serialize_all().unwrap();
+        FileIO::deserialize_all(&serialized).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_serialization_roundtrip() {
+        let file_io = roundtrip_file_io(&get_file_io().await);
+        let path = format!(
+            "s3://{OBJECT_STORE_BUCKET}/{}",
+            normalize_test_name_with_parts!("test_file_io_s3_serialization_roundtrip")
+        );
+
+        let _ = file_io.delete(&path).await;
+        file_io
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from_static(b"roundtrip"))
+            .await
+            .unwrap();
+        assert_eq!(
+            file_io.new_input(&path).unwrap().read().await.unwrap(),
+            Bytes::from_static(b"roundtrip")
+        );
+        file_io.delete(&path).await.unwrap();
+        assert!(!file_io.exists(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_exists() {
+        let file_io = get_file_io().await;
+        assert!(!file_io.exists("s3://bucket2/any").await.unwrap());
+        assert!(
+            file_io
+                .exists(&format!("s3://{OBJECT_STORE_BUCKET}/"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_output() {
+        let file_io = get_file_io().await;
+        // Use unique file path based on module path to avoid conflicts
+        let output_path = format!(
+            "s3://{OBJECT_STORE_BUCKET}/{}",
+            normalize_test_name_with_parts!("test_file_io_s3_output")
+        );
+        // Clean up from any previous test runs
+        let _ = file_io.delete(&output_path).await;
+        assert!(!file_io.exists(&output_path).await.unwrap());
+        let output_file = file_io.new_output(&output_path).unwrap();
+        {
+            output_file.write("123".into()).await.unwrap();
+        }
+        assert!(file_io.exists(&output_path).await.unwrap());
+    }
+
+    /// `ParquetWriter` hands over a whole row group in one `write` call, so an
+    /// unbounded part size would make the request as large as that row group.
+    #[tokio::test]
+    async fn test_file_io_s3_writer_splits_write_into_bounded_parts() {
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        const PARTS: usize = 3;
+
+        let file_io =
+            get_file_io_with_props(vec![(S3_MULTIPART_PART_SIZE_BYTES, PART_SIZE.to_string())])
+                .await;
+        let key = normalize_test_name_with_parts!(
+            "test_file_io_s3_writer_splits_write_into_bounded_parts"
+        );
+        let path = format!("s3://{OBJECT_STORE_BUCKET}/{key}");
+
+        let _ = file_io.delete(&path).await;
+        let mut writer = file_io.new_output(&path).unwrap().writer().await.unwrap();
+        writer
+            .write(Bytes::from(vec![0u8; PART_SIZE * PARTS]))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(upload_part_count(&key).await, PARTS);
+        file_io.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_write_splits_buffer_into_bounded_parts() {
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        const PARTS: usize = 3;
+
+        let file_io =
+            get_file_io_with_props(vec![(S3_MULTIPART_PART_SIZE_BYTES, PART_SIZE.to_string())])
+                .await;
+        let key = normalize_test_name_with_parts!(
+            "test_file_io_s3_write_splits_buffer_into_bounded_parts"
+        );
+        let path = format!("s3://{OBJECT_STORE_BUCKET}/{key}");
+
+        let _ = file_io.delete(&path).await;
+        file_io
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from(vec![0u8; PART_SIZE * PARTS]))
+            .await
+            .unwrap();
+
+        assert_eq!(upload_part_count(&key).await, PARTS);
+        file_io.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_write_below_part_size_stays_single_request() {
+        let file_io = get_file_io_with_props(vec![(
+            S3_MULTIPART_PART_SIZE_BYTES,
+            (5 * 1024 * 1024).to_string(),
+        )])
+        .await;
+        let key = normalize_test_name_with_parts!(
+            "test_file_io_s3_write_below_part_size_stays_single_request"
+        );
+        let path = format!("s3://{OBJECT_STORE_BUCKET}/{key}");
+
+        let _ = file_io.delete(&path).await;
+        file_io
+            .new_output(&path)
+            .unwrap()
+            .write(Bytes::from_static(b"{\"format-version\":2}"))
+            .await
+            .unwrap();
+
+        assert_eq!(upload_part_count(&key).await, 1);
+        file_io.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_input() {
+        let file_io = get_file_io().await;
+        // Use unique file path based on module path to avoid conflicts
+        let file_path = format!(
+            "s3://{OBJECT_STORE_BUCKET}/{}",
+            normalize_test_name_with_parts!("test_file_io_s3_input")
+        );
+        let output_file = file_io.new_output(&file_path).unwrap();
+        {
+            output_file.write("test_input".into()).await.unwrap();
+        }
+
+        let input_file = file_io.new_input(&file_path).unwrap();
+
+        {
+            let buffer = input_file.read().await.unwrap();
+            assert_eq!(buffer, "test_input".as_bytes());
+        }
+    }
+
+    // Mock credential loader for testing
+    #[derive(Debug)]
+    struct MockCredentialLoader {
+        credential: Option<AwsCredential>,
+    }
+
+    impl MockCredentialLoader {
+        fn new(credential: Option<AwsCredential>) -> Self {
+            Self { credential }
+        }
+
+        fn new_object_store() -> Self {
+            Self::new(Some(AwsCredential {
+                access_key_id: "admin".to_string(),
+                secret_access_key: "password".to_string(),
+                session_token: None,
+                expires_in: None,
+            }))
+        }
+    }
+
+    impl ProvideCredential for MockCredentialLoader {
+        type Credential = AwsCredential;
+
+        async fn provide_credential(
+            &self,
+            _ctx: &Context,
+        ) -> reqsign_core::Result<Option<AwsCredential>> {
+            Ok(self.credential.clone())
+        }
+    }
+
+    #[test]
+    fn test_custom_aws_credential_loader_instantiation() {
+        // Test creating CustomAwsCredentialLoader with mock loader
+        let mock_loader = MockCredentialLoader::new_object_store();
+        let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
+
+        // Test that the loader can be used in FileIOBuilder with OpenDalStorageFactory
+        let _builder = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: Some(custom_loader),
+        }))
+        .with_props(vec![
+            (S3_ENDPOINT, "http://localhost:9000".to_string()),
+            ("bucket", "test-bucket".to_string()),
+            (S3_REGION, "us-east-1".to_string()),
+            (S3_PATH_STYLE_ACCESS, "true".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_s3_with_custom_credential_loader_integration() {
+        let _file_io = get_file_io().await;
+
+        // Create a mock credential loader
+        let mock_loader = MockCredentialLoader::new_object_store();
+        let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
+
+        let object_store_endpoint = get_object_store_endpoint();
+
+        // Build FileIO with custom credential loader via OpenDalStorageFactory
+        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: Some(custom_loader),
+        }))
+        .with_props(vec![
+            (S3_ENDPOINT, object_store_endpoint),
+            (S3_REGION, "us-east-1".to_string()),
+            (S3_PATH_STYLE_ACCESS, "true".to_string()),
+        ])
+        .build();
+
+        // Test that the FileIO was built successfully with the custom loader
+        match file_io_with_custom_creds
+            .exists(&format!("s3://{OBJECT_STORE_BUCKET}/any"))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!("Failed to check existence of bucket: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_with_custom_credential_loader_integration_failure() {
+        let _file_io = get_file_io().await;
+
+        // Create a mock credential loader with no credentials
+        let mock_loader = MockCredentialLoader::new(None);
+        let custom_loader = CustomAwsCredentialLoader::new(mock_loader);
+
+        let object_store_endpoint = get_object_store_endpoint();
+
+        // Build FileIO with custom credential loader via OpenDalStorageFactory
+        let file_io_with_custom_creds = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: Some(custom_loader),
+        }))
+        .with_props(vec![
+            (S3_ENDPOINT, object_store_endpoint),
+            (S3_REGION, "us-east-1".to_string()),
+            (S3_PATH_STYLE_ACCESS, "true".to_string()),
+        ])
+        .build();
+
+        // Test that the FileIO was built successfully with the custom loader
+        match file_io_with_custom_creds
+            .exists(&format!("s3://{OBJECT_STORE_BUCKET}/any"))
+            .await
+        {
+            Ok(_) => panic!(
+                "Expected error, but got Ok - the credential loader should fail to provide valid credentials"
+            ),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("failed to load signing credential"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_delete_stream() {
+        let file_io = get_file_io().await;
+
+        // Write multiple files
+        let paths: Vec<String> = (0..5)
+            .map(|i| {
+                format!(
+                    "s3://{OBJECT_STORE_BUCKET}/{}/file-{i}",
+                    normalize_test_name_with_parts!("test_file_io_s3_delete_stream")
+                )
+            })
+            .collect();
+        for path in &paths {
+            let _ = file_io.delete(path).await;
+            file_io
+                .new_output(path)
+                .unwrap()
+                .write("delete-me".into())
+                .await
+                .unwrap();
+            assert!(file_io.exists(path).await.unwrap());
+        }
+
+        // Delete via delete_stream
+        let stream = futures::stream::iter(paths.clone()).boxed();
+        file_io.delete_stream(stream).await.unwrap();
+
+        // Verify all files are gone
+        for path in &paths {
+            assert!(!file_io.exists(path).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_delete_stream_empty() {
+        let file_io = get_file_io().await;
+        let stream = futures::stream::empty().boxed();
+        // Should succeed with no-op
+        file_io.delete_stream(stream).await.unwrap();
+    }
+}

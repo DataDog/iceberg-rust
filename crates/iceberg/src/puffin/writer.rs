@@ -19,10 +19,12 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 
+use super::validate_puffin_compression;
 use crate::Result;
-use crate::io::{FileWrite, OutputFile};
+use crate::compression::CompressionCodec;
+use crate::encryption::EncryptedOutputFile;
+use crate::io::{FileMetadata as IoFileMetadata, FileWrite, OutputFile};
 use crate::puffin::blob::Blob;
-use crate::puffin::compression::CompressionCodec;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata, Flag};
 
 /// Puffin writer
@@ -37,12 +39,41 @@ pub struct PuffinWriter {
 }
 
 impl PuffinWriter {
-    /// Returns a new Puffin writer
+    /// Returns a new Puffin writer for an unencrypted file.
     pub async fn new(
         output_file: &OutputFile,
         properties: HashMap<String, String>,
         compress_footer: bool,
     ) -> Result<Self> {
+        Ok(Self::from_writer(
+            output_file.writer().await?,
+            properties,
+            compress_footer,
+        ))
+    }
+
+    /// Returns a new Puffin writer from an [`EncryptedOutputFile`].
+    ///
+    /// Use this when writing Puffin files with transparent encryption. Blob
+    /// and footer offsets are recorded as plaintext positions, matching what
+    /// an unencrypted writer would produce.
+    pub async fn new_from_encrypted(
+        encrypted_output: &EncryptedOutputFile,
+        properties: HashMap<String, String>,
+        compress_footer: bool,
+    ) -> Result<Self> {
+        Ok(Self::from_writer(
+            encrypted_output.writer().await?,
+            properties,
+            compress_footer,
+        ))
+    }
+
+    fn from_writer(
+        writer: Box<dyn FileWrite>,
+        properties: HashMap<String, String>,
+        compress_footer: bool,
+    ) -> Self {
         let mut flags = HashSet::<Flag>::new();
         let footer_compression_codec = if compress_footer {
             flags.insert(Flag::FooterPayloadCompressed);
@@ -51,19 +82,21 @@ impl PuffinWriter {
             CompressionCodec::None
         };
 
-        Ok(Self {
-            writer: output_file.writer().await?,
+        Self {
+            writer,
             is_header_written: false,
             num_bytes_written: 0,
             written_blobs_metadata: Vec::new(),
             properties,
             footer_compression_codec,
             flags,
-        })
+        }
     }
 
     /// Adds blob to Puffin file
     pub async fn add(&mut self, blob: Blob, compression_codec: CompressionCodec) -> Result<()> {
+        validate_puffin_compression(compression_codec)?;
+
         self.write_header_once().await?;
 
         let offset = self.num_bytes_written;
@@ -84,12 +117,11 @@ impl PuffinWriter {
         Ok(())
     }
 
-    /// Finalizes the Puffin file
-    pub async fn close(mut self) -> Result<()> {
+    /// Finalizes the Puffin file and returns its stored size.
+    pub async fn close(mut self) -> Result<IoFileMetadata> {
         self.write_header_once().await?;
         self.write_footer().await?;
-        self.writer.close().await?;
-        Ok(())
+        self.writer.close().await
     }
 
     async fn write(&mut self, bytes: Bytes) -> Result<()> {
@@ -114,8 +146,7 @@ impl PuffinWriter {
             properties: self.properties.clone(),
         };
         let json = serde_json::to_string::<FileMetadata>(&file_metadata)?;
-        let bytes = json.as_bytes();
-        self.footer_compression_codec.compress(bytes.to_vec())
+        self.footer_compression_codec.compress(json.into_bytes())
     }
 
     fn flags_bytes(&self) -> [u8; FileMetadata::FOOTER_STRUCT_FLAGS_LENGTH as usize] {
@@ -148,26 +179,26 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::Result;
-    use crate::io::{FileIOBuilder, InputFile, OutputFile};
+    use crate::compression::CompressionCodec;
+    use crate::io::{FileIO, InputFile, OutputFile};
     use crate::puffin::blob::Blob;
-    use crate::puffin::compression::CompressionCodec;
     use crate::puffin::metadata::FileMetadata;
     use crate::puffin::reader::PuffinReader;
     use crate::puffin::test_utils::{
         blob_0, blob_1, empty_footer_payload, empty_footer_payload_bytes, file_properties,
         java_empty_uncompressed_input_file, java_uncompressed_metric_input_file,
-        java_zstd_compressed_metric_input_file, uncompressed_metric_file_metadata,
-        zstd_compressed_metric_file_metadata,
+        java_zstd_compressed_metric_input_file, read_file_metadata,
+        uncompressed_metric_file_metadata, zstd_compressed_metric_file_metadata,
     };
     use crate::puffin::writer::PuffinWriter;
+    use crate::{ErrorKind, Result};
 
     async fn write_puffin_file(
         temp_dir: &TempDir,
         blobs: Vec<(Blob, CompressionCodec)>,
         properties: HashMap<String, String>,
     ) -> Result<OutputFile> {
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
 
         let path_buf = temp_dir.path().join("temp_puffin.bin");
         let temp_path = path_buf.to_str().unwrap();
@@ -183,7 +214,7 @@ mod tests {
     }
 
     async fn read_all_blobs_from_puffin_file(input_file: InputFile) -> Vec<Blob> {
-        let puffin_reader = PuffinReader::new(input_file);
+        let puffin_reader = PuffinReader::new(input_file).await.unwrap();
         let mut blobs = Vec::new();
         let blobs_metadata = puffin_reader.file_metadata().await.unwrap().clone().blobs;
         for blob_metadata in blobs_metadata {
@@ -202,7 +233,7 @@ mod tests {
             .to_input_file();
 
         assert_eq!(
-            FileMetadata::read(&input_file).await.unwrap(),
+            read_file_metadata(&input_file).await.unwrap(),
             empty_footer_payload()
         );
 
@@ -238,7 +269,7 @@ mod tests {
             .to_input_file();
 
         assert_eq!(
-            FileMetadata::read(&input_file).await.unwrap(),
+            read_file_metadata(&input_file).await.unwrap(),
             uncompressed_metric_file_metadata()
         );
 
@@ -249,7 +280,8 @@ mod tests {
     async fn test_write_zstd_compressed_metric_data() {
         let temp_dir = TempDir::new().unwrap();
         let blobs = vec![blob_0(), blob_1()];
-        let blobs_with_compression = blobs_with_compression(blobs.clone(), CompressionCodec::Zstd);
+        let blobs_with_compression =
+            blobs_with_compression(blobs.clone(), CompressionCodec::zstd_default());
 
         let input_file = write_puffin_file(&temp_dir, blobs_with_compression, file_properties())
             .await
@@ -257,7 +289,7 @@ mod tests {
             .to_input_file();
 
         assert_eq!(
-            FileMetadata::read(&input_file).await.unwrap(),
+            read_file_metadata(&input_file).await.unwrap(),
             zstd_compressed_metric_file_metadata()
         );
 
@@ -321,7 +353,8 @@ mod tests {
     async fn test_zstd_compressed_metric_data_is_bit_identical_to_java_generated_file() {
         let temp_dir = TempDir::new().unwrap();
         let blobs = vec![blob_0(), blob_1()];
-        let blobs_with_compression = blobs_with_compression(blobs, CompressionCodec::Zstd);
+        let blobs_with_compression =
+            blobs_with_compression(blobs, CompressionCodec::zstd_default());
 
         assert_files_are_bit_identical(
             write_puffin_file(&temp_dir, blobs_with_compression, file_properties())
@@ -330,5 +363,76 @@ mod tests {
             java_zstd_compressed_metric_input_file(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn test_gzip_compression_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let blobs = vec![blob_0()];
+        let blobs_with_compression =
+            blobs_with_compression(blobs, CompressionCodec::gzip_default());
+
+        let result = write_puffin_file(&temp_dir, blobs_with_compression, file_properties()).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("gzip"));
+        assert!(
+            err.to_string()
+                .contains("is not supported for Puffin files")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_write_read_roundtrip() {
+        use crate::encryption::{EncryptedInputFile, EncryptedOutputFile, StandardKeyMetadata};
+
+        let key_metadata = || {
+            StandardKeyMetadata::try_new(b"0123456789abcdef")
+                .unwrap()
+                .with_aad_prefix(b"test-aad-prefix!")
+        };
+
+        let file_io = FileIO::new_with_memory();
+        let path = "memory:///test/encrypted.puffin";
+        let blobs = vec![blob_0(), blob_1()];
+
+        // Write through the encrypting writer.
+        let encrypted_output =
+            EncryptedOutputFile::new(file_io.new_output(path).unwrap(), key_metadata());
+        let mut writer =
+            PuffinWriter::new_from_encrypted(&encrypted_output, file_properties(), false)
+                .await
+                .unwrap();
+        for blob in blobs.clone() {
+            writer.add(blob, CompressionCodec::None).await.unwrap();
+        }
+        let file_metadata = writer.close().await.unwrap();
+
+        // The ciphertext on disk must not equal a plaintext puffin file.
+        let raw = file_io.new_input(path).unwrap().read().await.unwrap();
+        assert_ne!(
+            &raw[..FileMetadata::MAGIC_LENGTH as usize],
+            FileMetadata::MAGIC
+        );
+
+        // Read back through the decrypting reader over plaintext offsets.
+        let key_metadata = encrypted_output.key_metadata_with_saved_file_metadata(&file_metadata);
+        assert_eq!(key_metadata.file_length(), Some(raw.len() as u64));
+        let encrypted_input =
+            EncryptedInputFile::new(file_io.new_input(path).unwrap(), key_metadata);
+        let reader = PuffinReader::new_from_encrypted(encrypted_input)
+            .await
+            .unwrap();
+
+        let file_metadata = reader.file_metadata().await.unwrap().clone();
+        assert_eq!(file_metadata, uncompressed_metric_file_metadata());
+
+        let mut read_blobs = Vec::new();
+        for blob_metadata in &file_metadata.blobs {
+            read_blobs.push(reader.blob(blob_metadata).await.unwrap());
+        }
+        assert_eq!(read_blobs, blobs);
     }
 }

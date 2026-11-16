@@ -15,10 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, List
+from pathlib import Path
+from typing import Any
+
 import pytest
-
-
 from pyiceberg.io import FileIO
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.manifest import (
@@ -27,19 +27,41 @@ from pyiceberg.manifest import (
     FileFormat,
     ManifestEntry,
     ManifestEntryStatus,
+    ManifestFile,
     _manifests,
+    write_manifest_list,
 )
 
 
 @pytest.fixture(autouse=True)
 def clear_global_manifests_cache() -> None:
     # Clear the global cache before each test
-    _manifests.cache_clear()  # type: ignore
+    cache_clear = getattr(_manifests, "cache_clear", None)
+    if callable(cache_clear):
+        # pyiceberg<=0.10: _manifests was lru_cache-decorated.
+        cache_clear()
+        return
+
+    # pyiceberg>=0.11: manifests are cached in module-level LRUCache.
+    from pyiceberg import manifest as manifest_module
+
+    manifest_cache = getattr(manifest_module, "_manifest_cache", None)
+    manifest_cache_lock = getattr(manifest_module, "_manifest_cache_lock", None)
+
+    if manifest_cache is None:
+        return
+
+    if manifest_cache_lock is None:
+        manifest_cache.clear()
+        return
+
+    with manifest_cache_lock:
+        manifest_cache.clear()
 
 
 def fetch_manifest_entry(
     manifest_entry_file: str, io: FileIO, discard_deleted: bool = True
-) -> List[ManifestEntry]:
+) -> list[ManifestEntry]:
     from pyiceberg_core import manifest
 
     bs = io.new_input(manifest_entry_file).open().read()
@@ -49,31 +71,43 @@ def fetch_manifest_entry(
     # but this is the easiest for now until we
     # have the write part in there as well
     def _convert_entry(entry: Any) -> ManifestEntry:
-        data_file = DataFile(
-            DataFileContent(entry.data_file.content),
-            entry.data_file.file_path,
-            FileFormat(entry.data_file.file_format),
-            [p.value() if p is not None else None for p in entry.data_file.partition],
-            entry.data_file.record_count,
-            entry.data_file.file_size_in_bytes,
-            entry.data_file.column_sizes,
-            entry.data_file.value_counts,
-            entry.data_file.null_value_counts,
-            entry.data_file.nan_value_counts,
-            entry.data_file.lower_bounds,
-            entry.data_file.upper_bounds,
-            entry.data_file.key_metadata,
-            entry.data_file.split_offsets,
-            entry.data_file.equality_ids,
-            entry.data_file.sort_order_id,
+        data_file_args = {
+            "content": DataFileContent(entry.data_file.content),
+            "file_path": entry.data_file.file_path,
+            "file_format": FileFormat(entry.data_file.file_format),
+            "partition": [
+                p.value() if p is not None else None for p in entry.data_file.partition
+            ],
+            "record_count": entry.data_file.record_count,
+            "file_size_in_bytes": entry.data_file.file_size_in_bytes,
+            "column_sizes": entry.data_file.column_sizes,
+            "value_counts": entry.data_file.value_counts,
+            "null_value_counts": entry.data_file.null_value_counts,
+            "nan_value_counts": entry.data_file.nan_value_counts,
+            "lower_bounds": entry.data_file.lower_bounds,
+            "upper_bounds": entry.data_file.upper_bounds,
+            "key_metadata": entry.data_file.key_metadata,
+            "split_offsets": entry.data_file.split_offsets,
+            "equality_ids": entry.data_file.equality_ids,
+            "sort_order_id": entry.data_file.sort_order_id,
+        }
+        data_file = (
+            DataFile.from_args(**data_file_args)
+            if hasattr(DataFile, "from_args")
+            else DataFile(**data_file_args)
         )
 
-        return ManifestEntry(
-            ManifestEntryStatus(entry.status),
-            entry.snapshot_id,
-            entry.sequence_number,
-            entry.file_sequence_number,
-            data_file,
+        manifest_entry_args = {
+            "status": ManifestEntryStatus(entry.status),
+            "snapshot_id": entry.snapshot_id,
+            "sequence_number": entry.sequence_number,
+            "file_sequence_number": entry.file_sequence_number,
+            "data_file": data_file,
+        }
+        return (
+            ManifestEntry.from_args(**manifest_entry_args)
+            if hasattr(ManifestEntry, "from_args")
+            else ManifestEntry(**manifest_entry_args)
         )
 
     return [
@@ -140,3 +174,64 @@ def test_read_manifest_entry(generated_manifest_entry_file: str) -> None:
     assert data_file.split_offsets == [4]
     assert data_file.equality_ids is None
     assert data_file.sort_order_id == 0
+
+
+@pytest.mark.parametrize(
+    "payload", [b"", b"not-an-avro-file", b"Obj\x01truncated-after-the-avro-magic"]
+)
+def test_read_manifest_entries_raises_on_invalid_avro(payload: bytes) -> None:
+    from pyiceberg_core import manifest
+
+    with pytest.raises(ValueError):
+        manifest.read_manifest_entries(payload)
+
+
+@pytest.mark.parametrize(
+    "payload", [b"", b"not-an-avro-file", b"Obj\x01truncated-after-the-avro-magic"]
+)
+def test_read_manifest_list_raises_on_invalid_avro(payload: bytes) -> None:
+    from pyiceberg_core import manifest
+
+    with pytest.raises(ValueError):
+        manifest.read_manifest_list(payload)
+
+
+def test_manifest_file_without_partition_summaries(tmp_path: Path) -> None:
+    """Field summaries are optional, so a manifest list without them reads back as None."""
+    from pyiceberg_core import manifest
+
+    manifest_list_file = str(tmp_path / "snap.avro")
+    io = PyArrowFileIO()
+
+    with write_manifest_list(
+        format_version=2,
+        output_file=io.new_output(manifest_list_file),
+        snapshot_id=25,
+        parent_snapshot_id=None,
+        sequence_number=1,
+        avro_compression="null",
+    ) as writer:
+        writer.add_manifests(
+            [
+                ManifestFile.from_args(
+                    manifest_path="s3://bucket/metadata/manifest.avro",
+                    manifest_length=1024,
+                    partition_spec_id=0,
+                    added_snapshot_id=25,
+                    sequence_number=1,
+                    min_sequence_number=1,
+                    added_files_count=1,
+                    existing_files_count=0,
+                    deleted_files_count=0,
+                    added_rows_count=10,
+                    existing_rows_count=0,
+                    deleted_rows_count=0,
+                    partitions=None,
+                )
+            ]
+        )
+
+    bs = io.new_input(manifest_list_file).open().read()
+    manifest_file = manifest.read_manifest_list(bs).entries()[0]
+
+    assert manifest_file.partitions is None

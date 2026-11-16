@@ -21,52 +21,55 @@ on:
   push:
     branches:
       - main
-  pull_request:
     paths:
-      - '**'                              # Include all files and directories in the repository by default.
-      - '!.github/ISSUE_TEMPLATE/**'      # Exclude files and directories that don't impact tests or code like templates, metadata, and documentation.
-      - '!scripts/**'
+      # Artifacts that must be included in releases, such as LICENSE and NOTICE, are deliberately not excluded so we can verify they will be bundled.
+      # Include all files and directories, then filter out files and directories that don't impact code, tests, or release artifacts.
+      - '**'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - '!dev/release/**'
       - '!website/**'
       - '!.asf.yml'
       - '!.gitattributes'
       - '!.gitignore'
       - '!CONTRIBUTING.md'
       - '!CHANGELOG.md'
-      - '!LICENSE'
-      - '!NOTICE'
       - '!README.md'
+  pull_request:
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
-env:
-  rust_msrv: "1.87"
+permissions:
+  contents: read
 
 jobs:
-  check:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+  lint:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
+        uses: $/.github/actions/setup-builder
+
+      - name: Install lint tools
+        # Keep versions in sync with the local install targets in Makefile.
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: taplo@0.9.3,cargo-machete@0.7.0,cargo-deny@0.19.9
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.12
 
       - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.7.0
+        uses: apache/skywalking-eyes/header@a196742f472feaffafea537ce5a2a4c3c53a8de4 # v0.9.0
 
       - name: Check toml format
-        run: make check-toml
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: taplo fmt --check
 
       - name: Cargo format
         run: make check-fmt
@@ -74,107 +77,231 @@ jobs:
       - name: Check diff
         run: git diff --exit-code
 
+      - name: Check Cargo.lock is up-to-date
+        run: cargo update --workspace --locked
+
+      - name: Check crates package LICENSE and NOTICE
+        run: make check-license-notice
+
+      - name: Check dependency licenses
+        run: python3 ./dev/release/licenses.py dependencies check
+
+      # Trusted publishing cannot create a crate (https://crates.io/docs/trusted-publishing),
+      # so a new publishable crate must be reserved on crates.io before it is merged.
+      # See "Adding a new crate" in website/src/release.md.
+      - name: Check publishable crates exist on crates.io
+        run: |
+          pkgs=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.publish != []) | .name')
+          # A failed `cargo metadata` would otherwise leave the loop empty and the step green.
+          [ -n "$pkgs" ] || { echo "::error::No publishable crates found in the workspace, expected at least one"; exit 1; }
+          for pkg in $pkgs; do
+            # --registry is required, otherwise cargo resolves the local workspace member.
+            if ! cargo info --registry crates-io "$pkg" >/dev/null; then
+              echo "::error::$pkg is not on crates.io. Reserve it before merging; see 'Adding a new crate' in website/src/release.md"
+              exit 1
+            fi
+          done
+
+      - name: Cargo Machete
+        run: cargo machete
+
+      - name: Check typos
+        uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+
+  clippy:
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: $/.github/actions/setup-builder
+
       - name: Cargo clippy
         run: make check-clippy
 
-      - name: Cargo Machete
-        run: make cargo-machete
+      - name: Cargo doc
+        run: make check-doc
 
   build:
+    needs: lint
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     strategy:
+      max-parallel: 15
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-24.04
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
+        uses: $/.github/actions/setup-builder
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: make build
 
+  # Checks each crate individually to catch missing feature declarations that
+  # are otherwise masked by Cargo's feature unification across the workspace.
+  check_standalone:
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: $/.github/actions/setup-builder
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Check each crate standalone
+        run: |
+          for pkg in $(cargo metadata --no-deps --format-version=1 | jq -r '.packages[].name'); do
+            echo "Checking $pkg..."
+            cargo check -p "$pkg" --all-targets || exit 1
+          done
+
+      # Dry-runs the publish without compiling, which catches dependency cycles between
+      # workspace crates, versions that do not resolve on crates.io, and missing metadata.
+      # publish.yml runs the full dry-run with compilation on release candidate tags.
+      - name: Check each crate can be published
+        run: cargo publish --workspace --all-features --dry-run --no-verify
+
+  # Verifies the core iceberg crate compiles without default features, ensuring
+  # optional functionality is properly gated behind feature flags.
   build_with_no_default_features:
+    needs: lint
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     strategy:
+      max-parallel: 15
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-24.04
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
+        uses: $/.github/actions/setup-builder
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: cargo build -p iceberg --no-default-features
 
-  unit:
-    runs-on: ubuntu-latest
+  tests:
+    needs: lint
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    strategy:
+      max-parallel: 15
+      matrix:
+        test-suite:
+          - { name: "default", args: "--all-targets --all-features --workspace" }
+          - { name: "doc", args: "--doc --all-features --workspace" }
+    name: Tests (${{ matrix.test-suite.name }})
     steps:
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
-          remove-codeql: "true"
-          remove-docker-images: "true"
-          root-reserve-mb: 10240
-          temp-reserve-mb: 10240
-
-      - uses: actions/checkout@v5
+          persist-credentials: false
 
       - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: $/.github/actions/setup-builder
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.test-suite.name }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-      - name: Test
-        run: cargo test --no-fail-fast --all-targets --all-features --workspace
+      - name: Install cargo-nextest
+        if: matrix.test-suite.name == 'default'
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest
 
-      - name: Smol Test
-        run: cargo test --no-fail-fast --all-targets --no-default-features --features "smol" --features "storage-all" --workspace
+      - name: Start Docker containers
+        if: matrix.test-suite.name == 'default'
+        run: make docker-up
 
-      - name: Doc Test
-        run: cargo test --no-fail-fast --doc --all-features --workspace
+      - name: Run tests
+        shell: bash
+        env:
+          # HuggingFace Hub integration tests self-skip when these are unset
+          # (e.g. PRs from forks); see crates/storage/opendal/tests/file_io_hf_test.rs
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_BUCKET: ${{ secrets.HF_BUCKET }}
+          HF_DATASET: ${{ secrets.HF_DATASET }}
+        run: |
+          if [ "${{ matrix.test-suite.name }}" = "default" ]; then
+            cargo nextest run ${{ matrix.test-suite.args }}
+          else
+            cargo test --no-fail-fast ${{ matrix.test-suite.args }}
+          fi
+
+      - name: Stop Docker containers
+        if: always() && matrix.test-suite.name == 'default'
+        run: make docker-down
 
   msrv:
     name: Verify MSRV
-    runs-on: ubuntu-latest
+    needs: lint
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      - name: Get MSRV
+        id: get-msrv
+        uses: $/.github/actions/get-msrv
       - name: Setup MSRV Rust toolchain
-        uses: ./.github/actions/setup-builder
+        uses: $/.github/actions/setup-builder
         with:
-          rust-version: ${{ env.rust_msrv }}
+          rust-version: ${{ steps.get-msrv.outputs.msrv }}
       - name: Setup Nightly Rust toolchain
-        uses: ./.github/actions/setup-builder
+        uses: $/.github/actions/setup-builder
       - name: Check MSRV
         run: make check-msrv
+
+  ci-required:
+    if: ${{ always() }}
+    needs: [lint, clippy, build, check_standalone, build_with_no_default_features, tests, msrv]
+    runs-on: ubuntu-slim
+    steps:
+      - name: Verify CI jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          read -ra results <<< "$RESULTS"
+          for result in "${results[@]}"; do
+            test "$result" = "success"
+          done

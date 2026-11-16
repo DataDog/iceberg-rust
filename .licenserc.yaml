@@ -21,16 +21,27 @@ header:
     copyright-owner: Apache Software Foundation
 
   paths-ignore:
-    - 'LICENSE'
-    - 'NOTICE'
-    - '.gitattributes'
-    - '**/*.json'
+    - "LICENSE"
+    - "NOTICE"
+    - "bindings/python/third-party-licenses.txt"
+    - "bindings/python/third-party-notices.txt"
+    - ".gitattributes"
+    - "**/*.json"
     # Generated content by mdbook
-    - 'website/book'
-    # Generated content by scripts
-    - '**/DEPENDENCIES.*.tsv'
+    - "website/book"
+    # Generated content by cargo-public-api
+    - "**/public-api.txt"
+    # Generated content by trybuild
+    - "**/*.stderr"
     # Release distributions
-    - 'dist/*'
-    - 'Cargo.lock'
-    - '.github/PULL_REQUEST_TEMPLATE.md'
+    - "dist/*"
+    - "target"
+    - "Cargo.lock"
+    - "bindings/python/uv.lock"
+    # GitHub configuration
+    - ".github/PULL_REQUEST_TEMPLATE.md"
+    - ".github/copilot-instructions.md"
+    # Python environment
+    - "bindings/python/.venv/"
+    - "bindings/python/.pytest_cache/"
   comment: on-failure

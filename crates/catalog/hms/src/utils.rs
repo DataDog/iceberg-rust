@@ -37,7 +37,7 @@ const OWNER: &str = "owner";
 const COMMENT: &str = "comment";
 /// hive metatore `location` property
 const LOCATION: &str = "location";
-/// hive metatore `metadat_location` property
+/// hive metatore `metadata_location` property
 const METADATA_LOCATION: &str = "metadata_location";
 /// hive metatore `external` property
 const EXTERNAL: &str = "EXTERNAL";
@@ -128,7 +128,7 @@ pub(crate) fn convert_to_database(
                     _ => {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
-                            format!("Invalid value for setting 'owner_type': {}", v),
+                            format!("Invalid value for setting 'owner_type': {v}"),
                         ));
                     }
                 };
@@ -214,8 +214,7 @@ pub(crate) fn validate_namespace(namespace: &NamespaceIdent) -> Result<String> {
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Invalid database name: {:?}, hierarchical namespaces are not supported",
-                namespace
+                "Invalid database name: {namespace:?}, hierarchical namespaces are not supported"
             ),
         ));
     }
@@ -257,7 +256,7 @@ pub(crate) fn get_metadata_location(
             Some(location) => Ok(location.to_string()),
             None => Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!("No '{}' set on table", METADATA_LOCATION),
+                format!("No '{METADATA_LOCATION}' set on table"),
             )),
         },
         None => Err(Error::new(
@@ -272,7 +271,7 @@ fn format_location_uri(location: String) -> String {
     let mut location = location;
 
     if !location.starts_with('/') {
-        location = format!("/{}", location);
+        location = format!("/{location}");
     }
 
     if location.ends_with('/') && location.len() > 1 {
@@ -292,8 +291,7 @@ fn validate_owner_settings(properties: &HashMap<String, String>) -> Result<()> {
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Setting '{}' without setting '{}' is not allowed",
-                HMS_DB_OWNER_TYPE, HMS_DB_OWNER
+                "Setting '{HMS_DB_OWNER_TYPE}' without setting '{HMS_DB_OWNER}' is not allowed"
             ),
         ));
     }
@@ -313,8 +311,8 @@ fn get_current_time() -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{NestedField, PrimitiveType, Type};
-    use iceberg::{MetadataLocation, Namespace, NamespaceIdent};
+    use iceberg::spec::{NestedField, PrimitiveType, TableMetadataBuilder, Type};
+    use iceberg::{MetadataLocation, Namespace, NamespaceIdent, TableCreation};
 
     use super::*;
 
@@ -345,8 +343,6 @@ mod tests {
         let db_name = "my_db".to_string();
         let table_name = "my_table".to_string();
         let location = "s3a://warehouse/hms".to_string();
-        let metadata_location =
-            MetadataLocation::new_with_table_location(location.clone()).to_string();
         let properties = HashMap::new();
         let schema = Schema::builder()
             .with_schema_id(1)
@@ -355,6 +351,17 @@ mod tests {
                 NestedField::required(2, "bar", Type::Primitive(PrimitiveType::Int)).into(),
             ])
             .build()?;
+
+        let table_creation = TableCreation::builder()
+            .name(table_name.clone())
+            .location(location.clone())
+            .schema(schema.clone())
+            .properties(properties.clone())
+            .build();
+        let metadata = TableMetadataBuilder::from_table_creation(table_creation)?
+            .build()?
+            .metadata;
+        let metadata_location = MetadataLocation::try_new_with_metadata(&metadata)?.to_string();
 
         let result = convert_to_hive_table(
             db_name.clone(),

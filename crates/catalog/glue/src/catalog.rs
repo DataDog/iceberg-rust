@@ -17,26 +17,32 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
+use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{
-    FileIO, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+    FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
+    S3_SESSION_TOKEN, StorageFactory,
 };
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Runtime, TableCommit, TableCreation, TableIdent, delete_removed_metadata_files,
 };
+use iceberg_property_macro::Properties;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
     convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
-    get_default_table_location, get_metadata_location, validate_namespace,
+    get_default_table_location, get_metadata_location, is_iceberg_table, validate_namespace,
 };
 use crate::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
@@ -50,151 +56,225 @@ pub const GLUE_CATALOG_PROP_CATALOG_ID: &str = "catalog_id";
 pub const GLUE_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 
 /// Builder for [`GlueCatalog`].
-#[derive(Debug)]
-pub struct GlueCatalogBuilder(GlueCatalogConfig);
-
-impl Default for GlueCatalogBuilder {
-    fn default() -> Self {
-        Self(GlueCatalogConfig {
-            name: None,
-            uri: None,
-            catalog_id: None,
-            warehouse: "".to_string(),
-            props: HashMap::new(),
-        })
-    }
+#[derive(Debug, Default)]
+pub struct GlueCatalogBuilder {
+    storage_factory: Option<Arc<dyn StorageFactory>>,
+    kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    runtime: Option<Runtime>,
 }
 
 impl CatalogBuilder for GlueCatalogBuilder {
     type C = GlueCatalog;
 
+    fn with_storage_factory(mut self, storage_factory: Arc<dyn StorageFactory>) -> Self {
+        self.storage_factory = Some(storage_factory);
+        self
+    }
+
+    fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
+        self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     fn load(
-        mut self,
+        self,
         name: impl Into<String>,
         props: HashMap<String, String>,
     ) -> impl Future<Output = Result<Self::C>> + Send {
-        self.0.name = Some(name.into());
-
-        if props.contains_key(GLUE_CATALOG_PROP_URI) {
-            self.0.uri = props.get(GLUE_CATALOG_PROP_URI).cloned()
-        }
-
-        if props.contains_key(GLUE_CATALOG_PROP_CATALOG_ID) {
-            self.0.catalog_id = props.get(GLUE_CATALOG_PROP_CATALOG_ID).cloned()
-        }
-
-        if props.contains_key(GLUE_CATALOG_PROP_WAREHOUSE) {
-            self.0.warehouse = props
-                .get(GLUE_CATALOG_PROP_WAREHOUSE)
-                .cloned()
-                .unwrap_or_default();
-        }
-
-        // Collect other remaining properties
-        self.0.props = props
-            .into_iter()
-            .filter(|(k, _)| {
-                k != GLUE_CATALOG_PROP_URI
-                    && k != GLUE_CATALOG_PROP_CATALOG_ID
-                    && k != GLUE_CATALOG_PROP_WAREHOUSE
-            })
-            .collect();
+        let name = name.into();
 
         async move {
-            if self.0.name.is_none() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Catalog name is required",
-                ));
-            }
-            if self.0.warehouse.is_empty() {
+            let catalog_properties = GlueCatalogProperties::from_properties(&props)?;
+            if catalog_properties.warehouse.is_empty() {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Catalog warehouse is required",
                 ));
             }
 
-            GlueCatalog::new(self.0).await
+            let runtime = match self.runtime {
+                Some(rt) => rt,
+                None => Runtime::try_current()?,
+            };
+            let kms_client = match self.kms_client_factory {
+                Some(factory) => Some(factory.create_kms_client(&props).await?),
+                None => None,
+            };
+            GlueCatalog::new(
+                name,
+                catalog_properties,
+                props,
+                self.storage_factory,
+                runtime,
+                kms_client,
+            )
+            .await
         }
     }
 }
 
-#[derive(Debug)]
-/// Glue Catalog configuration
-pub(crate) struct GlueCatalogConfig {
-    name: Option<String>,
+/// Glue catalog properties parsed from the `load` property map.
+#[derive(Debug, Properties)]
+pub(crate) struct GlueCatalogProperties {
+    #[property(key = GLUE_CATALOG_PROP_URI, default = None)]
     uri: Option<String>,
+    #[property(key = GLUE_CATALOG_PROP_CATALOG_ID, default = None)]
     catalog_id: Option<String>,
+    #[property(key = GLUE_CATALOG_PROP_WAREHOUSE, default = "")]
     warehouse: String,
-    props: HashMap<String, String>,
 }
 
 struct GlueClient(aws_sdk_glue::Client);
 
 /// Glue Catalog
 pub struct GlueCatalog {
-    config: GlueCatalogConfig,
+    name: String,
+    properties: GlueCatalogProperties,
     client: GlueClient,
     file_io: FileIO,
+    runtime: Runtime,
+    kms_client: Option<Arc<dyn KeyManagementClient>>,
 }
 
 impl Debug for GlueCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GlueCatalog")
-            .field("config", &self.config)
+            .field("name", &self.name)
+            .field("properties", &self.properties)
             .finish_non_exhaustive()
     }
 }
 
 impl GlueCatalog {
     /// Create a new glue catalog
-    async fn new(config: GlueCatalogConfig) -> Result<Self> {
-        let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
-        let mut file_io_props = config.props.clone();
-        if !file_io_props.contains_key(S3_ACCESS_KEY_ID) {
-            if let Some(access_key_id) = file_io_props.get(AWS_ACCESS_KEY_ID) {
-                file_io_props.insert(S3_ACCESS_KEY_ID.to_string(), access_key_id.to_string());
-            }
+    async fn new(
+        name: String,
+        properties: GlueCatalogProperties,
+        props: HashMap<String, String>,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
+        runtime: Runtime,
+        kms_client: Option<Arc<dyn KeyManagementClient>>,
+    ) -> Result<Self> {
+        let sdk_config = create_sdk_config(&props, properties.uri.as_ref()).await;
+        let mut file_io_props = props;
+        if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
+            && let Some(access_key_id) = file_io_props.get(AWS_ACCESS_KEY_ID)
+        {
+            file_io_props.insert(S3_ACCESS_KEY_ID.to_string(), access_key_id.to_string());
         }
-        if !file_io_props.contains_key(S3_SECRET_ACCESS_KEY) {
-            if let Some(secret_access_key) = file_io_props.get(AWS_SECRET_ACCESS_KEY) {
-                file_io_props.insert(
-                    S3_SECRET_ACCESS_KEY.to_string(),
-                    secret_access_key.to_string(),
-                );
-            }
+        if !file_io_props.contains_key(S3_SECRET_ACCESS_KEY)
+            && let Some(secret_access_key) = file_io_props.get(AWS_SECRET_ACCESS_KEY)
+        {
+            file_io_props.insert(
+                S3_SECRET_ACCESS_KEY.to_string(),
+                secret_access_key.to_string(),
+            );
         }
-        if !file_io_props.contains_key(S3_REGION) {
-            if let Some(region) = file_io_props.get(AWS_REGION_NAME) {
-                file_io_props.insert(S3_REGION.to_string(), region.to_string());
-            }
+        if !file_io_props.contains_key(S3_REGION)
+            && let Some(region) = file_io_props.get(AWS_REGION_NAME)
+        {
+            file_io_props.insert(S3_REGION.to_string(), region.to_string());
         }
-        if !file_io_props.contains_key(S3_SESSION_TOKEN) {
-            if let Some(session_token) = file_io_props.get(AWS_SESSION_TOKEN) {
-                file_io_props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
-            }
+        if !file_io_props.contains_key(S3_SESSION_TOKEN)
+            && let Some(session_token) = file_io_props.get(AWS_SESSION_TOKEN)
+        {
+            file_io_props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
         }
-        if !file_io_props.contains_key(S3_ENDPOINT) {
-            if let Some(aws_endpoint) = config.uri.as_ref() {
-                file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
-            }
+        if !file_io_props.contains_key(S3_ENDPOINT)
+            && let Some(aws_endpoint) = properties.uri.as_ref()
+        {
+            file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
         }
 
         let client = aws_sdk_glue::Client::new(&sdk_config);
 
-        let file_io = FileIO::from_path(&config.warehouse)?
+        // Use provided factory or default to OpenDalStorageFactory::S3
+        let factory = storage_factory.unwrap_or_else(|| {
+            Arc::new(OpenDalStorageFactory::S3 {
+                customized_credential_load: None,
+            })
+        });
+        let file_io = FileIOBuilder::new(factory)
             .with_props(file_io_props)
-            .build()?;
+            .build();
 
         Ok(GlueCatalog {
-            config,
+            name,
+            properties,
             client: GlueClient(client),
             file_io,
+            runtime,
+            kms_client,
         })
     }
     /// Get the catalogs `FileIO`
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()
+    }
+
+    /// Loads a table from the Glue Catalog along with its version_id for optimistic locking.
+    ///
+    /// # Returns
+    /// A `Result` wrapping a tuple of (`Table`, `Option<String>`) where the String is the version_id
+    /// from Glue that should be used for optimistic concurrency control when updating the table.
+    ///
+    /// # Errors
+    /// This function may return an error in several scenarios, including:
+    /// - Failure to validate the namespace.
+    /// - Failure to retrieve the table from the Glue Catalog.
+    /// - Absence of metadata location information in the table's properties.
+    /// - Issues reading or deserializing the table's metadata file.
+    async fn load_table_with_version_id(
+        &self,
+        table: &TableIdent,
+    ) -> Result<(Table, Option<String>)> {
+        let db_name = validate_namespace(table.namespace())?;
+        let table_name = table.name();
+
+        let builder = self
+            .client
+            .0
+            .get_table()
+            .database_name(&db_name)
+            .name(table_name);
+        let builder = with_catalog_id!(builder, self.properties);
+
+        let glue_table_output = builder.send().await.map_err(from_aws_sdk_error)?;
+
+        let glue_table = glue_table_output.table().ok_or_else(|| {
+            Error::new(
+                ErrorKind::TableNotFound,
+                format!(
+                    "Table object for database: {db_name} and table: {table_name} does not exist"
+                ),
+            )
+        })?;
+
+        let version_id = glue_table.version_id.clone();
+        let metadata_location = get_metadata_location(&glue_table.parameters)?;
+
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+
+        let mut builder = Table::builder()
+            .file_io(self.file_io())
+            .metadata_location(metadata_location)
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new(db_name),
+                table_name.to_owned(),
+            ))
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        let table = builder.build()?;
+
+        Ok((table, version_id))
     }
 }
 
@@ -220,7 +300,7 @@ impl Catalog for GlueCatalog {
                 Some(token) => self.client.0.get_databases().next_token(token),
                 None => self.client.0.get_databases(),
             };
-            let builder = with_catalog_id!(builder, self.config);
+            let builder = with_catalog_id!(builder, self.properties);
             let resp = builder.send().await.map_err(from_aws_sdk_error)?;
 
             let dbs: Vec<NamespaceIdent> = resp
@@ -258,10 +338,17 @@ impl Catalog for GlueCatalog {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<Namespace> {
+        if self.namespace_exists(namespace).await? {
+            return Err(Error::new(
+                ErrorKind::NamespaceAlreadyExists,
+                format!("Namespace {namespace:?} already exists"),
+            ));
+        }
+
         let db_input = convert_to_database(namespace, &properties)?;
 
         let builder = self.client.0.create_database().database_input(db_input);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         builder.send().await.map_err(from_aws_sdk_error)?;
 
@@ -282,9 +369,21 @@ impl Catalog for GlueCatalog {
         let db_name = validate_namespace(namespace)?;
 
         let builder = self.client.0.get_database().name(&db_name);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
-        let resp = builder.send().await.map_err(from_aws_sdk_error)?;
+        let resp = builder.send().await.map_err(|err| {
+            if err
+                .as_service_error()
+                .map(|e| e.is_entity_not_found_exception())
+                == Some(true)
+            {
+                return Error::new(
+                    ErrorKind::NamespaceNotFound,
+                    format!("Namespace {namespace:?} does not exist"),
+                );
+            }
+            from_aws_sdk_error(err)
+        })?;
 
         match resp.database() {
             Some(db) => {
@@ -292,8 +391,8 @@ impl Catalog for GlueCatalog {
                 Ok(namespace)
             }
             None => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Database with name: {} does not exist", db_name),
+                ErrorKind::NamespaceNotFound,
+                format!("Database with name: {db_name} does not exist"),
             )),
         }
     }
@@ -314,7 +413,7 @@ impl Catalog for GlueCatalog {
         let db_name = validate_namespace(namespace)?;
 
         let builder = self.client.0.get_database().name(&db_name);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         let resp = builder.send().await;
 
@@ -348,6 +447,13 @@ impl Catalog for GlueCatalog {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<()> {
+        if !self.namespace_exists(namespace).await? {
+            return Err(Error::new(
+                ErrorKind::NamespaceNotFound,
+                format!("Namespace {namespace:?} does not exist"),
+            ));
+        }
+
         let db_name = validate_namespace(namespace)?;
         let db_input = convert_to_database(namespace, &properties)?;
 
@@ -357,7 +463,7 @@ impl Catalog for GlueCatalog {
             .update_database()
             .name(&db_name)
             .database_input(db_input);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         builder.send().await.map_err(from_aws_sdk_error)?;
 
@@ -375,30 +481,53 @@ impl Catalog for GlueCatalog {
     /// - `Err(...)` signifies failure to drop the namespace due to validation
     /// errors, connectivity issues, or Glue Catalog constraints.
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
-        let db_name = validate_namespace(namespace)?;
-        let table_list = self.list_tables(namespace).await?;
+        if !self.namespace_exists(namespace).await? {
+            return Err(Error::new(
+                ErrorKind::NamespaceNotFound,
+                format!("Namespace {namespace:?} does not exist"),
+            ));
+        }
 
-        if !table_list.is_empty() {
+        let db_name = validate_namespace(namespace)?;
+
+        // Check for ANY Glue table in the database, not just Iceberg tables.
+        // Glue's `delete_database` will fail if any table (Iceberg or not) is
+        // still present, and `list_tables` only returns Iceberg tables, so we
+        // query Glue directly here.
+        let builder = self
+            .client
+            .0
+            .get_tables()
+            .database_name(&db_name)
+            .max_results(1);
+        let builder = with_catalog_id!(builder, self.properties);
+        let resp = builder.send().await.map_err(from_aws_sdk_error)?;
+
+        if !resp.table_list().is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!("Database with name: {} is not empty", &db_name),
+                format!("Database with name: {} is not empty", db_name),
             ));
         }
 
         let builder = self.client.0.delete_database().name(db_name);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         builder.send().await.map_err(from_aws_sdk_error)?;
 
         Ok(())
     }
 
-    /// Asynchronously lists all tables within a specified namespace.
+    /// Asynchronously lists all Iceberg tables within a specified namespace.
+    ///
+    /// Glue databases may contain a mix of Iceberg and non-Iceberg tables
+    /// (e.g. plain Hive tables). Only tables whose `table_type` parameter is
+    /// set to `ICEBERG` (case-insensitive) are returned
     ///
     /// # Returns
     /// A `Result<Vec<TableIdent>>`, which is:
     /// - `Ok(vec![...])` containing a vector of `TableIdent` instances, each
-    /// representing a table within the specified namespace.
+    /// representing an Iceberg table within the specified namespace.
     /// - `Err(...)` if an error occurs during namespace validation or while
     /// querying the database.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
@@ -417,12 +546,13 @@ impl Catalog for GlueCatalog {
                     .next_token(token),
                 None => self.client.0.get_tables().database_name(&db_name),
             };
-            let builder = with_catalog_id!(builder, self.config);
+            let builder = with_catalog_id!(builder, self.properties);
             let resp = builder.send().await.map_err(from_aws_sdk_error)?;
 
             let tables: Vec<_> = resp
                 .table_list()
                 .iter()
+                .filter(|tbl| is_iceberg_table(&tbl.parameters))
                 .map(|tbl| TableIdent::new(namespace.clone(), tbl.name().to_string()))
                 .collect();
 
@@ -457,27 +587,23 @@ impl Catalog for GlueCatalog {
         let db_name = validate_namespace(namespace)?;
         let table_name = creation.name.clone();
 
-        let location = match &creation.location {
-            Some(location) => location.clone(),
-            None => {
-                let ns = self.get_namespace(namespace).await?;
-                let location =
-                    get_default_table_location(&ns, &db_name, &table_name, &self.config.warehouse);
-                creation.location = Some(location.clone());
-                location
-            }
-        };
+        if creation.location.is_none() {
+            let ns = self.get_namespace(namespace).await?;
+            let location =
+                get_default_table_location(&ns, &db_name, &table_name, &self.properties.warehouse);
+            creation.location = Some(location);
+        }
         let metadata = TableMetadataBuilder::from_table_creation(creation)?
             .build()?
             .metadata;
-        let metadata_location =
-            MetadataLocation::new_with_table_location(location.clone()).to_string();
+        let metadata_location = MetadataLocation::try_new_with_metadata(&metadata)?;
 
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
+        let metadata_location_str = metadata_location.to_string();
         let glue_table = convert_to_glue_table(
             &table_name,
-            metadata_location.clone(),
+            metadata_location_str.clone(),
             &metadata,
             metadata.properties(),
             None,
@@ -489,16 +615,20 @@ impl Catalog for GlueCatalog {
             .create_table()
             .database_name(&db_name)
             .table_input(glue_table);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         builder.send().await.map_err(from_aws_sdk_error)?;
 
-        Table::builder()
+        let mut builder = Table::builder()
             .file_io(self.file_io())
-            .metadata_location(metadata_location)
+            .metadata_location(metadata_location_str)
             .metadata(metadata)
             .identifier(TableIdent::new(NamespaceIdent::new(db_name), table_name))
-            .build()
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        builder.build()
     }
 
     /// Loads a table from the Glue Catalog and constructs a `Table` object
@@ -514,43 +644,8 @@ impl Catalog for GlueCatalog {
     /// - Absence of metadata location information in the table's properties.
     /// - Issues reading or deserializing the table's metadata file.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        let db_name = validate_namespace(table.namespace())?;
-        let table_name = table.name();
-
-        let builder = self
-            .client
-            .0
-            .get_table()
-            .database_name(&db_name)
-            .name(table_name);
-        let builder = with_catalog_id!(builder, self.config);
-
-        let glue_table_output = builder.send().await.map_err(from_aws_sdk_error)?;
-
-        match glue_table_output.table() {
-            None => Err(Error::new(
-                ErrorKind::TableNotFound,
-                format!(
-                    "Table object for database: {} and table: {} does not exist",
-                    db_name, table_name
-                ),
-            )),
-            Some(table) => {
-                let metadata_location = get_metadata_location(&table.parameters)?;
-
-                let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
-
-                Table::builder()
-                    .file_io(self.file_io())
-                    .metadata_location(metadata_location)
-                    .metadata(metadata)
-                    .identifier(TableIdent::new(
-                        NamespaceIdent::new(db_name),
-                        table_name.to_owned(),
-                    ))
-                    .build()
-            }
-        }
+        let (table, _) = self.load_table_with_version_id(table).await?;
+        Ok(table)
     }
 
     /// Asynchronously drops a table from the database.
@@ -573,11 +668,17 @@ impl Catalog for GlueCatalog {
             .delete_table()
             .database_name(&db_name)
             .name(table_name);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         builder.send().await.map_err(from_aws_sdk_error)?;
 
         Ok(())
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+        let table_info = self.load_table(table).await?;
+        self.drop_table(table).await?;
+        iceberg::drop_table_data(&table_info).await
     }
 
     /// Asynchronously checks the existence of a specified table
@@ -597,7 +698,7 @@ impl Catalog for GlueCatalog {
             .get_table()
             .database_name(&db_name)
             .name(table_name);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         let resp = builder.send().await;
 
@@ -635,7 +736,7 @@ impl Catalog for GlueCatalog {
             .get_table()
             .database_name(&src_db_name)
             .name(src_table_name);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         let glue_table_output = builder.send().await.map_err(from_aws_sdk_error)?;
 
@@ -643,8 +744,7 @@ impl Catalog for GlueCatalog {
             None => Err(Error::new(
                 ErrorKind::TableNotFound,
                 format!(
-                    "'Table' object for database: {} and table: {} does not exist",
-                    src_db_name, src_table_name
+                    "'Table' object for database: {src_db_name} and table: {src_table_name} does not exist"
                 ),
             )),
             Some(table) => {
@@ -663,7 +763,7 @@ impl Catalog for GlueCatalog {
                     .create_table()
                     .database_name(&dest_db_name)
                     .table_input(rename_table_input);
-                let builder = with_catalog_id!(builder, self.config);
+                let builder = with_catalog_id!(builder, self.properties);
 
                 builder.send().await.map_err(from_aws_sdk_error)?;
 
@@ -672,10 +772,8 @@ impl Catalog for GlueCatalog {
                 match drop_src_table_result {
                     Ok(_) => Ok(()),
                     Err(_) => {
-                        let err_msg_src_table = format!(
-                            "Failed to drop old table {}.{}.",
-                            src_db_name, src_table_name
-                        );
+                        let err_msg_src_table =
+                            format!("Failed to drop old table {src_db_name}.{src_table_name}.");
 
                         let drop_dest_table_result = self.drop_table(dest).await;
 
@@ -683,15 +781,13 @@ impl Catalog for GlueCatalog {
                             Ok(_) => Err(Error::new(
                                 ErrorKind::Unexpected,
                                 format!(
-                                    "{} Rolled back table creation for {}.{}.",
-                                    err_msg_src_table, dest_db_name, dest_table_name
+                                    "{err_msg_src_table} Rolled back table creation for {dest_db_name}.{dest_table_name}."
                                 ),
                             )),
                             Err(_) => Err(Error::new(
                                 ErrorKind::Unexpected,
                                 format!(
-                                    "{} Failed to roll back table creation for {}.{}. Please clean up manually.",
-                                    err_msg_src_table, dest_db_name, dest_table_name
+                                    "{err_msg_src_table} Failed to roll back table creation for {dest_db_name}.{dest_table_name}. Please clean up manually."
                                 ),
                             )),
                         }
@@ -735,7 +831,7 @@ impl Catalog for GlueCatalog {
             .create_table()
             .database_name(&db_name)
             .table_input(table_input);
-        let builder = with_catalog_id!(builder, self.config);
+        let builder = with_catalog_id!(builder, self.properties);
 
         builder.send().await.map_err(|e| {
             let error = e.into_service_error();
@@ -753,34 +849,42 @@ impl Catalog for GlueCatalog {
                     format!("Failed to register table {table_ident} due to AWS SDK error"),
                 ),
             }
-            .with_source(anyhow!("aws sdk error: {:?}", error))
+            .with_source(anyhow!("aws sdk error: {error:?}"))
         })?;
 
-        Ok(Table::builder()
+        let mut builder = Table::builder()
             .identifier(table_ident.clone())
             .metadata_location(metadata_location)
             .metadata(metadata)
             .file_io(self.file_io())
-            .build()?)
+            .runtime(self.runtime.clone());
+        if let Some(kms_client) = self.kms_client.clone() {
+            builder = builder.kms_client(kms_client);
+        }
+        Ok(builder.build()?)
     }
 
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let table_namespace = validate_namespace(table_ident.namespace())?;
-        let current_table = self.load_table(&table_ident).await?;
+
+        let (current_table, current_version_id) =
+            self.load_table_with_version_id(&table_ident).await?;
         let current_metadata_location = current_table.metadata_location_result()?.to_string();
+        let base_metadata = current_table.metadata_ref();
 
         let staged_table = commit.apply(current_table)?;
-        let staged_metadata_location = staged_table.metadata_location_result()?;
+        let staged_metadata_location_str = staged_table.metadata_location_result()?;
+        let staged_metadata_location = MetadataLocation::from_str(staged_metadata_location_str)?;
 
         // Write new metadata
         staged_table
             .metadata()
-            .write_to(staged_table.file_io(), staged_metadata_location)
+            .write_to(staged_table.file_io(), &staged_metadata_location)
             .await?;
 
-        // Persist staged table to Glue
-        let builder = self
+        // Persist staged table to Glue with optimistic locking
+        let mut builder = self
             .client
             .0
             .update_table()
@@ -793,7 +897,13 @@ impl Catalog for GlueCatalog {
                 staged_table.metadata().properties(),
                 Some(current_metadata_location),
             )?);
-        let builder = with_catalog_id!(builder, self.config);
+
+        // Add VersionId for optimistic locking
+        if let Some(version_id) = current_version_id {
+            builder = builder.version_id(version_id);
+        }
+
+        let builder = with_catalog_id!(builder, self.properties);
         let _ = builder.send().await.map_err(|e| {
             let error = e.into_service_error();
             match error {
@@ -811,9 +921,126 @@ impl Catalog for GlueCatalog {
                     format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
                 ),
             }
-            .with_source(anyhow!("aws sdk error: {:?}", error))
+            .with_source(anyhow!("aws sdk error: {error:?}"))
         })?;
 
+        delete_removed_metadata_files(
+            staged_table.file_io(),
+            &base_metadata,
+            staged_table.metadata(),
+        )
+        .await;
+
         Ok(staged_table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn test_catalog_properties() {
+        let properties = GlueCatalogProperties::from_properties(&HashMap::from([
+            (
+                GLUE_CATALOG_PROP_URI.to_string(),
+                "http://localhost".to_string(),
+            ),
+            (
+                GLUE_CATALOG_PROP_CATALOG_ID.to_string(),
+                "catalog".to_string(),
+            ),
+            (
+                GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+                "s3://warehouse".to_string(),
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(properties.uri.as_deref(), Some("http://localhost"));
+        assert_eq!(properties.catalog_id.as_deref(), Some("catalog"));
+        assert_eq!(properties.warehouse, "s3://warehouse");
+    }
+
+    #[test]
+    fn test_catalog_properties_defaults() {
+        let properties = GlueCatalogProperties::from_properties(&HashMap::new()).unwrap();
+
+        assert_eq!(properties.uri, None);
+        assert_eq!(properties.catalog_id, None);
+        assert_eq!(properties.warehouse, "");
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_missing_or_empty_warehouse() {
+        for (case, props) in [
+            ("missing", HashMap::new()),
+            (
+                "empty",
+                HashMap::from([(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), String::new())]),
+            ),
+        ] {
+            let error = GlueCatalogBuilder::default()
+                .load("glue", props)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                (error.kind(), error.message()),
+                (ErrorKind::DataInvalid, "Catalog warehouse is required"),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_forwards_all_properties_to_kms_factory() {
+        #[derive(Debug, Default)]
+        struct RecordingKmsClientFactory(Mutex<HashMap<String, String>>);
+
+        #[async_trait]
+        impl KmsClientFactory for RecordingKmsClientFactory {
+            async fn create_kms_client(
+                &self,
+                properties: &HashMap<String, String>,
+            ) -> Result<Arc<dyn KeyManagementClient>> {
+                *self.0.lock().unwrap() = properties.clone();
+                Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "KMS initialization failed",
+                ))
+            }
+        }
+
+        let properties = HashMap::from([
+            (
+                GLUE_CATALOG_PROP_URI.to_string(),
+                "http://localhost".to_string(),
+            ),
+            (
+                GLUE_CATALOG_PROP_CATALOG_ID.to_string(),
+                "catalog".to_string(),
+            ),
+            (
+                GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+                "s3://warehouse".to_string(),
+            ),
+            (AWS_REGION_NAME.to_string(), "us-east-1".to_string()),
+            ("custom.property".to_string(), "value".to_string()),
+        ]);
+        let factory = Arc::new(RecordingKmsClientFactory::default());
+        let error = GlueCatalogBuilder::default()
+            .with_kms_client_factory(factory.clone())
+            .load("glue", properties.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(*factory.0.lock().unwrap(), properties);
+        assert_eq!(
+            (error.kind(), error.message()),
+            (ErrorKind::Unexpected, "KMS initialization failed")
+        );
     }
 }

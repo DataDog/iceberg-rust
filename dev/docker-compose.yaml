@@ -1,0 +1,245 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Unified Docker Compose for all integration tests.
+# This file combines services needed for REST, HMS, Glue, S3, and GCS tests.
+# Start once with: docker compose -f dev/docker-compose.yaml up -d --wait
+# Stop with: docker compose -f dev/docker-compose.yaml down -v
+
+networks:
+  iceberg_test:
+
+services:
+  # =============================================================================
+  # Object store - S3-compatible storage backed by RustFS (shared by all tests)
+  # =============================================================================
+  object-store:
+    image: rustfs/rustfs:1.0.3
+    environment:
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=password
+      - RUSTFS_OBS_LOG_STDOUT_ENABLED=true
+      - RUSTFS_CONSOLE_ENABLE=false
+      - RUSTFS_SERVER_DOMAINS=object-store
+    hostname: object-store
+    networks:
+      iceberg_test:
+        # Add aliases for virtual-hosted style bucket access
+        aliases:
+          - icebergdata.object-store
+          - warehouse.object-store
+          - bucket1.object-store
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # One-shot job that creates buckets for tests. Re-creating an existing bucket
+  # returns 200, so this is safe to re-run.
+  create-buckets:
+    depends_on:
+      object-store:
+        condition: service_healthy
+    image: rustfs/rustfs:1.0.3
+    entrypoint: >
+      /bin/sh -c "
+        curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 -u admin:password -X PUT http://object-store:9000/icebergdata &&
+        curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 -u admin:password -X PUT http://object-store:9000/warehouse &&
+        curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 -u admin:password -X PUT http://object-store:9000/bucket1
+      "
+    networks:
+      iceberg_test:
+
+  # =============================================================================
+  # REST Catalog - Apache Iceberg REST Catalog
+  # =============================================================================
+  rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog
+      - CATALOG_URI=jdbc:sqlite:file:/tmp/iceberg_rest.db?journal_mode=WAL
+      - CATALOG_WAREHOUSE=s3://icebergdata/demo
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://object-store:9000
+    depends_on:
+      object-store:
+        condition: service_healthy
+    networks:
+      iceberg_test:
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # =============================================================================
+  # Hive Metastore - HMS Catalog
+  # =============================================================================
+  hive-metastore:
+    build:
+      context: ./hms
+      dockerfile: Dockerfile
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/amd64}
+    depends_on:
+      object-store:
+        condition: service_healthy
+    networks:
+      iceberg_test:
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: "metastore"
+      SERVICE_OPTS: "-Dmetastore.warehouse.dir=s3a://warehouse/hive/"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # =============================================================================
+  # Moto - AWS Glue Mock for Glue Catalog tests
+  # =============================================================================
+  moto:
+    image: motoserver/moto:5.0.3
+    networks:
+      iceberg_test:
+    ports:
+      - "5001:5001"
+    environment:
+      # Use port 5001 instead of default 5000 to avoid conflict with macOS AirPlay Receiver.
+      - MOTO_PORT=5001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/moto-api/"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # HDFS - single-node NameNode + DataNode for HDFS tests
+  # =============================================================================
+  # The DataNode advertises 127.0.0.1, so clients that set
+  # `dfs.client.use.datanode.hostname` reach it through its published port.
+  hdfs-namenode:
+    image: apache/hadoop:3.5.0
+    networks:
+      iceberg_test:
+    command: ["hdfs", "namenode"]
+    environment:
+      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+    ports:
+      - "8020:8020"
+    volumes:
+      - ./hdfs/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hdfs/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get | grep -q OFF"]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+      start_period: 30s
+
+  hdfs-datanode:
+    image: apache/hadoop:3.5.0
+    networks:
+      iceberg_test:
+    command: ["hdfs", "datanode"]
+    depends_on:
+      hdfs-namenode:
+        condition: service_healthy
+    ports:
+      - "9866:9866"
+    volumes:
+      - ./hdfs/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hdfs/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+    # Healthy only once registered with the NameNode — writes fail until then.
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -report | grep -q 'Live datanodes (1)'"]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+      start_period: 10s
+
+  # =============================================================================
+  # Fake GCS Server - GCS emulator for GCS tests
+  # =============================================================================
+  gcs-server:
+    image: fsouza/fake-gcs-server@sha256:36b0116fae5236e8def76ccb07761a9ca323e476f366a5f4bf449cac19deaf2d
+    networks:
+      iceberg_test:
+    ports:
+      - "4443:4443"
+    command: --scheme http
+
+  # =============================================================================
+  # Spark - Spark with Iceberg for integration tests
+  # =============================================================================
+  spark-iceberg:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    networks:
+      iceberg_test:
+    depends_on:
+      rest:
+        condition: service_healthy
+      create-buckets:
+        condition: service_completed_successfully
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    ports:
+      - "15002:15002"
+      - "4040:4040"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 15002 | grep LISTEN"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  # Provision service - creates test data via Spark
+  provision:
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    networks:
+      iceberg_test:
+    depends_on:
+      spark-iceberg:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "uv run /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
+    volumes:
+      - ./spark/provision.py:/opt/spark/provision.py:ro
+      - uv-cache:/root/.cache/uv
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /tmp/provision_complete ]"]
+      interval: 2s
+      timeout: 2s
+      retries: 90
+      start_period: 20s
+
+volumes:
+  uv-cache:

@@ -33,104 +33,31 @@ use uuid::Uuid;
 use super::snapshot::SnapshotReference;
 pub use super::table_metadata_builder::{TableMetadataBuildResult, TableMetadataBuilder};
 use super::{
-    DEFAULT_PARTITION_SPEC_ID, PartitionSpecRef, PartitionStatisticsFile, SchemaId, SchemaRef,
-    SnapshotRef, SnapshotRetention, SortOrder, SortOrderRef, StatisticsFile, StructType,
+    DEFAULT_PARTITION_SPEC_ID, PartitionSpecRef, PartitionStatisticsFile, Schema, SchemaId,
+    SchemaRef, SnapshotRef, SnapshotRetention, SortOrder, SortOrderRef, StatisticsFile, StructType,
+    TableProperties, Transform,
 };
-use crate::error::{Result, timestamp_ms_to_utc};
+use crate::catalog::{METADATA_FOLDER_NAME, MetadataLocation};
+use crate::compression::CompressionCodec;
+use crate::error::{Result, invalid_data, timestamp_ms_to_utc};
 use crate::io::FileIO;
+use crate::partitioning::compute_unified_partition_type;
+use crate::spec::EncryptedKey;
 use crate::{Error, ErrorKind};
 
 static MAIN_BRANCH: &str = "main";
 pub(crate) static ONE_MINUTE_MS: i64 = 60_000;
 
+/// Sentinel value used by the Java implementation and older metadata files
+/// to represent a missing/empty current snapshot ID. During deserialization,
+/// this value is normalized to `None`.
 pub(crate) static EMPTY_SNAPSHOT_ID: i64 = -1;
 pub(crate) static INITIAL_SEQUENCE_NUMBER: i64 = 0;
 
-/// Reserved table property for table format version.
-///
-/// Iceberg will default a new table's format version to the latest stable and recommended
-/// version. This reserved property keyword allows users to override the Iceberg format version of
-/// the table metadata.
-///
-/// If this table property exists when creating a table, the table will use the specified format
-/// version. If a table updates this property, it will try to upgrade to the specified format
-/// version.
-pub const PROPERTY_FORMAT_VERSION: &str = "format-version";
-/// Reserved table property for table UUID.
-pub const PROPERTY_UUID: &str = "uuid";
-/// Reserved table property for the total number of snapshots.
-pub const PROPERTY_SNAPSHOT_COUNT: &str = "snapshot-count";
-/// Reserved table property for current snapshot summary.
-pub const PROPERTY_CURRENT_SNAPSHOT_SUMMARY: &str = "current-snapshot-summary";
-/// Reserved table property for current snapshot id.
-pub const PROPERTY_CURRENT_SNAPSHOT_ID: &str = "current-snapshot-id";
-/// Reserved table property for current snapshot timestamp.
-pub const PROPERTY_CURRENT_SNAPSHOT_TIMESTAMP: &str = "current-snapshot-timestamp-ms";
-/// Reserved table property for the JSON representation of current schema.
-pub const PROPERTY_CURRENT_SCHEMA: &str = "current-schema";
-/// Reserved table property for the JSON representation of current(default) partition spec.
-pub const PROPERTY_DEFAULT_PARTITION_SPEC: &str = "default-partition-spec";
-/// Reserved table property for the JSON representation of current(default) sort order.
-pub const PROPERTY_DEFAULT_SORT_ORDER: &str = "default-sort-order";
-
-/// Property key for max number of previous versions to keep.
-pub const PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX: &str = "write.metadata.previous-versions-max";
-/// Default value for max number of previous versions to keep.
-pub const PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT: usize = 100;
-
-/// Property key for max number of partitions to keep summary stats for.
-pub const PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT: &str = "write.summary.partition-limit";
-/// Default value for the max number of partitions to keep summary stats for.
-pub const PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT: u64 = 0;
-
-/// Reserved Iceberg table properties list.
-///
-/// Reserved table properties are only used to control behaviors when creating or updating a
-/// table. The value of these properties are not persisted as a part of the table metadata.
-pub const RESERVED_PROPERTIES: [&str; 9] = [
-    PROPERTY_FORMAT_VERSION,
-    PROPERTY_UUID,
-    PROPERTY_SNAPSHOT_COUNT,
-    PROPERTY_CURRENT_SNAPSHOT_ID,
-    PROPERTY_CURRENT_SNAPSHOT_SUMMARY,
-    PROPERTY_CURRENT_SNAPSHOT_TIMESTAMP,
-    PROPERTY_CURRENT_SCHEMA,
-    PROPERTY_DEFAULT_PARTITION_SPEC,
-    PROPERTY_DEFAULT_SORT_ORDER,
-];
-
-/// Property key for number of commit retries.
-pub const PROPERTY_COMMIT_NUM_RETRIES: &str = "commit.retry.num-retries";
-/// Default value for number of commit retries.
-pub const PROPERTY_COMMIT_NUM_RETRIES_DEFAULT: usize = 4;
-
-/// Property key for minimum wait time (ms) between retries.
-pub const PROPERTY_COMMIT_MIN_RETRY_WAIT_MS: &str = "commit.retry.min-wait-ms";
-/// Default value for minimum wait time (ms) between retries.
-pub const PROPERTY_COMMIT_MIN_RETRY_WAIT_MS_DEFAULT: u64 = 100;
-
-/// Property key for maximum wait time (ms) between retries.
-pub const PROPERTY_COMMIT_MAX_RETRY_WAIT_MS: &str = "commit.retry.max-wait-ms";
-/// Default value for maximum wait time (ms) between retries.
-pub const PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT: u64 = 60 * 1000; // 1 minute
-
-/// Property key for total maximum retry time (ms).
-pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS: &str = "commit.retry.total-timeout-ms";
-/// Default value for total maximum retry time (ms).
-pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT: u64 = 30 * 60 * 1000; // 30 minutes
-
-/// Default file format for data files
-pub const PROPERTY_DEFAULT_FILE_FORMAT: &str = "write.format.default";
-/// Default file format for delete files
-pub const PROPERTY_DELETE_DEFAULT_FILE_FORMAT: &str = "write.delete.format.default";
-/// Default value for data file format
-pub const PROPERTY_DEFAULT_FILE_FORMAT_DEFAULT: &str = "parquet";
-
-/// Target file size for newly written files.
-pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES: &str = "write.target-file-size-bytes";
-/// Default target file size
-pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT: usize = 512 * 1024 * 1024; // 512 MB
-
+/// Initial row id for row lineage for new v3 tables and older tables upgrading to v3.
+pub const INITIAL_ROW_ID: u64 = 0;
+/// Minimum format version that supports row lineage (v3).
+pub const MIN_FORMAT_VERSION_ROW_LINEAGE: FormatVersion = FormatVersion::V3;
 /// Reference to [`TableMetadata`].
 pub type TableMetadataRef = Arc<TableMetadata>;
 
@@ -208,8 +135,10 @@ pub struct TableMetadata {
     pub(crate) statistics: HashMap<i64, StatisticsFile>,
     /// Mapping of snapshot ids to partition statistics files.
     pub(crate) partition_statistics: HashMap<i64, PartitionStatisticsFile>,
-    /// Encryption Keys
-    pub(crate) encryption_keys: HashMap<String, String>,
+    /// Encryption Keys - map of key id to the actual key
+    pub(crate) encryption_keys: HashMap<String, EncryptedKey>,
+    /// Next row id to be assigned for Row Lineage (v3)
+    pub(crate) next_row_id: u64,
 }
 
 impl TableMetadata {
@@ -222,14 +151,6 @@ impl TableMetadata {
     #[must_use]
     pub fn into_builder(self, current_file_location: Option<String>) -> TableMetadataBuilder {
         TableMetadataBuilder::new_from_metadata(self, current_file_location)
-    }
-
-    /// Check if a partition field name exists in any partition spec.
-    #[inline]
-    pub(crate) fn partition_name_exists(&self, name: &str) -> bool {
-        self.partition_specs
-            .values()
-            .any(|spec| spec.fields().iter().any(|pf| pf.name == name))
     }
 
     /// Check if a field name exists in any schema.
@@ -349,6 +270,19 @@ impl TableMetadata {
         &self.default_partition_type
     }
 
+    /// Returns the unified partition type across every partition spec in the table, resolved
+    /// against `schema`.
+    ///
+    /// Unlike [`Self::default_partition_type`], the result contains all partition fields ever
+    /// used by the table, so partition values stay readable across partition spec evolution.
+    /// See [`compute_unified_partition_type`] for the exact merge rules.
+    pub fn unified_partition_type(&self, schema: &Schema) -> Result<StructType> {
+        compute_unified_partition_type(
+            self.partition_specs_iter().map(|spec| spec.as_ref()),
+            schema,
+        )
+    }
+
     #[inline]
     /// Returns spec id of the "current" partition spec.
     pub fn default_partition_spec_id(&self) -> i32 {
@@ -400,7 +334,7 @@ impl TableMetadata {
     pub fn snapshot_for_ref(&self, ref_name: &str) -> Option<&SnapshotRef> {
         self.refs.get(ref_name).map(|r| {
             self.snapshot_by_id(r.snapshot_id)
-                .unwrap_or_else(|| panic!("Snapshot id of ref {} doesn't exist", ref_name))
+                .unwrap_or_else(|| panic!("Snapshot id of ref {ref_name} doesn't exist"))
         })
     }
 
@@ -436,6 +370,35 @@ impl TableMetadata {
         &self.properties
     }
 
+    /// Returns the base location for metadata files (manifests, manifest lists).
+    ///
+    /// Honors the `write.metadata.path` table property when set, otherwise defaults
+    /// to the `metadata` subdirectory under the table location.
+    pub fn metadata_location(&self) -> Result<String> {
+        Ok(self
+            .table_properties()
+            .write_metadata_path()?
+            .unwrap_or_else(|| format!("{}/{}", self.location(), METADATA_FOLDER_NAME)))
+    }
+
+    /// Returns the metadata compression codec from table properties.
+    ///
+    /// Returns `CompressionCodec::None` if compression is disabled or not configured.
+    /// Returns `CompressionCodec::Gzip` if gzip compression is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compression codec property has an invalid value.
+    pub fn metadata_compression_codec(&self) -> Result<CompressionCodec> {
+        self.table_properties().metadata_compression_codec()
+    }
+
+    /// Returns a typed view that parses each table property when its getter is called.
+    #[inline]
+    pub fn table_properties(&self) -> TableProperties<'_> {
+        TableProperties::new(&self.properties)
+    }
+
     /// Return location of statistics files.
     #[inline]
     pub fn statistics_iter(&self) -> impl ExactSizeIterator<Item = &StatisticsFile> {
@@ -466,31 +429,37 @@ impl TableMetadata {
     }
 
     fn construct_refs(&mut self) {
-        if let Some(current_snapshot_id) = self.current_snapshot_id {
-            if !self.refs.contains_key(MAIN_BRANCH) {
-                self.refs
-                    .insert(MAIN_BRANCH.to_string(), SnapshotReference {
-                        snapshot_id: current_snapshot_id,
-                        retention: SnapshotRetention::Branch {
-                            min_snapshots_to_keep: None,
-                            max_snapshot_age_ms: None,
-                            max_ref_age_ms: None,
-                        },
-                    });
-            }
+        if let Some(current_snapshot_id) = self.current_snapshot_id
+            && !self.refs.contains_key(MAIN_BRANCH)
+        {
+            self.refs
+                .insert(MAIN_BRANCH.to_string(), SnapshotReference {
+                    snapshot_id: current_snapshot_id,
+                    retention: SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                });
         }
     }
 
     /// Iterate over all encryption keys
     #[inline]
-    pub fn encryption_keys_iter(&self) -> impl ExactSizeIterator<Item = (&String, &String)> {
-        self.encryption_keys.iter()
+    pub fn encryption_keys_iter(&self) -> impl ExactSizeIterator<Item = &EncryptedKey> {
+        self.encryption_keys.values()
     }
 
     /// Get the encryption key for a given key id
     #[inline]
-    pub fn encryption_key(&self, key_id: &str) -> Option<&String> {
+    pub fn encryption_key(&self, key_id: &str) -> Option<&EncryptedKey> {
         self.encryption_keys.get(key_id)
+    }
+
+    /// Get the next row id to be assigned
+    #[inline]
+    pub fn next_row_id(&self) -> u64 {
+        self.next_row_id
     }
 
     /// Read table metadata from the given location.
@@ -498,9 +467,27 @@ impl TableMetadata {
         file_io: &FileIO,
         metadata_location: impl AsRef<str>,
     ) -> Result<TableMetadata> {
+        let metadata_location = metadata_location.as_ref();
         let input_file = file_io.new_input(metadata_location)?;
         let metadata_content = input_file.read().await?;
-        let metadata = serde_json::from_slice::<TableMetadata>(&metadata_content)?;
+
+        // Check if the file is compressed by looking for the gzip "magic number".
+        let metadata = if metadata_content.len() > 2
+            && metadata_content[0] == 0x1F
+            && metadata_content[1] == 0x8B
+        {
+            let decompressed_data = CompressionCodec::gzip_default()
+                .decompress(metadata_content.to_vec())
+                .map_err(|e| {
+                    invalid_data!("Trying to read compressed metadata file")
+                        .with_context("file_path", metadata_location)
+                        .with_source(e)
+                })?;
+            serde_json::from_slice(&decompressed_data)?
+        } else {
+            serde_json::from_slice(&metadata_content)?
+        };
+
         Ok(metadata)
     }
 
@@ -508,11 +495,35 @@ impl TableMetadata {
     pub async fn write_to(
         &self,
         file_io: &FileIO,
-        metadata_location: impl AsRef<str>,
+        metadata_location: &MetadataLocation,
     ) -> Result<()> {
+        let json_data = serde_json::to_vec(self)?;
+
+        // Check if compression codec from properties matches the one in metadata_location
+        let codec = self.table_properties().metadata_compression_codec()?;
+
+        if codec != metadata_location.compression_codec() {
+            return Err(invalid_data!(
+                "Compression codec mismatch: metadata_location has {:?}, but table properties specify {:?}",
+                metadata_location.compression_codec(),
+                codec
+            ));
+        }
+
+        // Apply compression based on codec
+        let data_to_write = match codec {
+            CompressionCodec::Gzip(_) => codec.compress(json_data)?,
+            CompressionCodec::None => json_data,
+            _ => {
+                return Err(invalid_data!(
+                    "Unsupported metadata compression codec: {codec:?}"
+                ));
+            }
+        };
+
         file_io
-            .new_output(metadata_location)?
-            .write(serde_json::to_vec(self)?.into())
+            .new_output(metadata_location.to_string())?
+            .write(data_to_write.into())
             .await
     }
 
@@ -533,13 +544,29 @@ impl TableMetadata {
         // Normalize location (remove trailing slash)
         self.location = self.location.trim_end_matches('/').to_string();
         self.validate_snapshot_sequence_number()?;
+        self.validate_schema_format_compatibility()?;
         self.try_normalize_partition_spec()?;
         self.try_normalize_sort_order()?;
         Ok(self)
     }
 
-    /// If the default partition spec is not present in specs, add it
+    /// Validate active default-spec sources and add the spec if it is not present.
     fn try_normalize_partition_spec(&mut self) -> Result<()> {
+        for field in self.default_spec.fields() {
+            // Historical specs may reference dropped columns, but active default-spec
+            // fields need a source for new writes. Void fields do not read their source.
+            if field.transform != Transform::Void
+                && self.current_schema().field_by_id(field.source_id).is_none()
+            {
+                return Err(invalid_data!(
+                    "Default partition spec {} references missing source field {} in current schema {}",
+                    self.default_spec.spec_id(),
+                    field.source_id,
+                    self.current_schema_id
+                ));
+            }
+        }
+
         if self
             .partition_spec_by_id(self.default_spec.spec_id())
             .is_none()
@@ -555,17 +582,27 @@ impl TableMetadata {
 
     /// If the default sort order is unsorted but the sort order is not present, add it
     fn try_normalize_sort_order(&mut self) -> Result<()> {
+        // Validate that sort order ID 0 (reserved for unsorted) has no fields
+        if let Some(sort_order) = self.sort_order_by_id(SortOrder::UNSORTED_ORDER_ID)
+            && !sort_order.fields.is_empty()
+        {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Sort order ID {} is reserved for unsorted order",
+                    SortOrder::UNSORTED_ORDER_ID
+                ),
+            ));
+        }
+
         if self.sort_order_by_id(self.default_sort_order_id).is_some() {
             return Ok(());
         }
 
         if self.default_sort_order_id != SortOrder::UNSORTED_ORDER_ID {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "No sort order exists with the default sort order id {}.",
-                    self.default_sort_order_id
-                ),
+            return Err(invalid_data!(
+                "No sort order exists with the default sort order id {}.",
+                self.default_sort_order_id
             ));
         }
 
@@ -578,12 +615,9 @@ impl TableMetadata {
     /// Validate the current schema is set and exists.
     fn validate_current_schema(&self) -> Result<()> {
         if self.schema_by_id(self.current_schema_id).is_none() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "No schema exists with the current schema id {}.",
-                    self.current_schema_id
-                ),
+            return Err(invalid_data!(
+                "No schema exists with the current schema id {}.",
+                self.current_schema_id
             ));
         }
         Ok(())
@@ -595,12 +629,8 @@ impl TableMetadata {
             if current_snapshot_id == EMPTY_SNAPSHOT_ID {
                 self.current_snapshot_id = None;
             } else if self.snapshot_by_id(current_snapshot_id).is_none() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Snapshot for current snapshot id {} does not exist in the existing snapshots list",
-                        current_snapshot_id
-                    ),
+                return Err(invalid_data!(
+                    "Snapshot for current snapshot id {current_snapshot_id} does not exist in the existing snapshots list"
                 ));
             }
         }
@@ -611,33 +641,26 @@ impl TableMetadata {
     fn validate_refs(&self) -> Result<()> {
         for (name, snapshot_ref) in self.refs.iter() {
             if self.snapshot_by_id(snapshot_ref.snapshot_id).is_none() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Snapshot for reference {name} does not exist in the existing snapshots list"
-                    ),
+                return Err(invalid_data!(
+                    "Snapshot for reference {name} does not exist in the existing snapshots list"
                 ));
             }
         }
 
         let main_ref = self.refs.get(MAIN_BRANCH);
         if self.current_snapshot_id.is_some() {
-            if let Some(main_ref) = main_ref {
-                if main_ref.snapshot_id != self.current_snapshot_id.unwrap_or_default() {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Current snapshot id does not match main branch ({:?} != {:?})",
-                            self.current_snapshot_id.unwrap_or_default(),
-                            main_ref.snapshot_id
-                        ),
-                    ));
-                }
+            if let Some(main_ref) = main_ref
+                && main_ref.snapshot_id != self.current_snapshot_id.unwrap_or_default()
+            {
+                return Err(invalid_data!(
+                    "Current snapshot id does not match main branch ({:?} != {:?})",
+                    self.current_snapshot_id.unwrap_or_default(),
+                    main_ref.snapshot_id
+                ));
             }
         } else if main_ref.is_some() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Current snapshot is not set, but main branch exists",
+            return Err(invalid_data!(
+                "Current snapshot is not set, but main branch exists"
             ));
         }
 
@@ -647,31 +670,24 @@ impl TableMetadata {
     /// Validate that for V1 Metadata the last_sequence_number is 0
     fn validate_snapshot_sequence_number(&self) -> Result<()> {
         if self.format_version < FormatVersion::V2 && self.last_sequence_number != 0 {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Last sequence number must be 0 in v1. Found {}",
-                    self.last_sequence_number
-                ),
+            return Err(invalid_data!(
+                "Last sequence number must be 0 in v1. Found {}",
+                self.last_sequence_number
             ));
         }
 
-        if self.format_version >= FormatVersion::V2 {
-            if let Some(snapshot) = self
+        if self.format_version >= FormatVersion::V2
+            && let Some(snapshot) = self
                 .snapshots
                 .values()
                 .find(|snapshot| snapshot.sequence_number() > self.last_sequence_number)
-            {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid snapshot with id {} and sequence number {} greater than last sequence number {}",
-                        snapshot.snapshot_id(),
-                        snapshot.sequence_number(),
-                        self.last_sequence_number
-                    ),
-                ));
-            }
+        {
+            return Err(invalid_data!(
+                "Invalid snapshot with id {} and sequence number {} greater than last sequence number {}",
+                snapshot.snapshot_id(),
+                snapshot.sequence_number(),
+                self.last_sequence_number
+            ));
         }
 
         Ok(())
@@ -684,10 +700,7 @@ impl TableMetadata {
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
             if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Expected sorted snapshot log entries",
-                ));
+                return Err(invalid_data!("Expected sorted snapshot log entries"));
             }
         }
 
@@ -695,12 +708,10 @@ impl TableMetadata {
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
             if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid update timestamp {}: before last snapshot log entry at {}",
-                        self.last_updated_ms, last.timestamp_ms
-                    ),
+                return Err(invalid_data!(
+                    "Invalid update timestamp {}: before last snapshot log entry at {}",
+                    self.last_updated_ms,
+                    last.timestamp_ms
                 ));
             }
         }
@@ -713,10 +724,7 @@ impl TableMetadata {
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
             if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Expected sorted metadata log entries",
-                ));
+                return Err(invalid_data!("Expected sorted metadata log entries"));
             }
         }
 
@@ -724,17 +732,22 @@ impl TableMetadata {
             // commits can happen concurrently from different machines.
             // A tolerance helps us avoid failure for small clock skew
             if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid update timestamp {}: before last metadata log entry at {}",
-                        self.last_updated_ms, last.timestamp_ms
-                    ),
+                return Err(invalid_data!(
+                    "Invalid update timestamp {}: before last metadata log entry at {}",
+                    self.last_updated_ms,
+                    last.timestamp_ms
                 ));
             }
         }
 
         Ok(())
+    }
+
+    /// Validates that every type used in the current schema is supported by the
+    /// table's format version.  Delegates to [`Schema::check_format_compatibility`].
+    fn validate_schema_format_compatibility(&self) -> Result<()> {
+        self.current_schema()
+            .check_format_compatibility(self.format_version)
     }
 }
 
@@ -755,20 +768,23 @@ pub(super) mod _serde {
     use uuid::Uuid;
 
     use super::{
-        DEFAULT_PARTITION_SPEC_ID, FormatVersion, MAIN_BRANCH, MetadataLog, SnapshotLog,
-        TableMetadata,
+        DEFAULT_PARTITION_SPEC_ID, EMPTY_SNAPSHOT_ID, FormatVersion, MAIN_BRANCH, MetadataLog,
+        SnapshotLog, TableMetadata,
     };
+    use crate::error::invalid_data;
     use crate::spec::schema::_serde::{SchemaV1, SchemaV2};
-    use crate::spec::snapshot::_serde::{SnapshotV1, SnapshotV2};
+    use crate::spec::snapshot::_serde::{SnapshotV1, SnapshotV2, SnapshotV3};
     use crate::spec::{
-        PartitionField, PartitionSpec, PartitionSpecRef, PartitionStatisticsFile, Schema,
-        SchemaRef, Snapshot, SnapshotReference, SnapshotRetention, SortOrder, StatisticsFile,
+        EncryptedKey, INITIAL_ROW_ID, PartitionField, PartitionSpec, PartitionSpecRef,
+        PartitionStatisticsFile, Schema, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention,
+        SortOrder, StatisticsFile, UnboundPartitionSpec,
     };
     use crate::{Error, ErrorKind};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(untagged)]
     pub(super) enum TableMetadataEnum {
+        V3(TableMetadataV3),
         V2(TableMetadataV2),
         V1(TableMetadataV1),
     }
@@ -776,8 +792,21 @@ pub(super) mod _serde {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
     /// Defines the structure of a v2 table metadata for serialization/deserialization
-    pub(super) struct TableMetadataV2 {
-        pub format_version: VersionNumber<2>,
+    pub(super) struct TableMetadataV3 {
+        pub format_version: VersionNumber<3>,
+        #[serde(flatten)]
+        pub shared: TableMetadataV2V3Shared,
+        pub next_row_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub encryption_keys: Option<Vec<EncryptedKey>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub snapshots: Option<Vec<SnapshotV3>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    /// Defines the structure of a v2 table metadata for serialization/deserialization
+    pub(super) struct TableMetadataV2V3Shared {
         pub table_uuid: Uuid,
         pub location: String,
         pub last_sequence_number: i64,
@@ -793,8 +822,6 @@ pub(super) mod _serde {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub current_snapshot_id: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub snapshots: Option<Vec<SnapshotV2>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         pub snapshot_log: Option<Vec<SnapshotLog>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub metadata_log: Option<Vec<MetadataLog>>,
@@ -806,6 +833,17 @@ pub(super) mod _serde {
         pub statistics: Vec<StatisticsFile>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub partition_statistics: Vec<PartitionStatisticsFile>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    /// Defines the structure of a v2 table metadata for serialization/deserialization
+    pub(super) struct TableMetadataV2 {
+        pub format_version: VersionNumber<2>,
+        #[serde(flatten)]
+        pub shared: TableMetadataV2V3Shared,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub snapshots: Option<Vec<SnapshotV2>>,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -888,6 +926,7 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadataEnum) -> Result<Self, Error> {
             match value {
+                TableMetadataEnum::V3(value) => value.try_into(),
                 TableMetadataEnum::V2(value) => value.try_into(),
                 TableMetadataEnum::V1(value) => value.try_into(),
             }
@@ -898,16 +937,24 @@ pub(super) mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadata) -> Result<Self, Error> {
             Ok(match value.format_version {
+                FormatVersion::V3 => TableMetadataEnum::V3(value.try_into()?),
                 FormatVersion::V2 => TableMetadataEnum::V2(value.into()),
                 FormatVersion::V1 => TableMetadataEnum::V1(value.try_into()?),
             })
         }
     }
 
-    impl TryFrom<TableMetadataV2> for TableMetadata {
+    impl TryFrom<TableMetadataV3> for TableMetadata {
         type Error = Error;
-        fn try_from(value: TableMetadataV2) -> Result<Self, self::Error> {
-            let current_snapshot_id = if let &Some(-1) = &value.current_snapshot_id {
+        fn try_from(value: TableMetadataV3) -> Result<Self, Error> {
+            let TableMetadataV3 {
+                format_version: _,
+                shared: value,
+                next_row_id,
+                encryption_keys,
+                snapshots,
+            } = value;
+            let current_snapshot_id = if value.current_snapshot_id == Some(EMPTY_SNAPSHOT_ID) {
                 None
             } else {
                 value.current_snapshot_id
@@ -922,12 +969,9 @@ pub(super) mod _serde {
 
             let current_schema: &SchemaRef =
                 schemas.get(&value.current_schema_id).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "No schema exists with the current schema id {}.",
-                            value.current_schema_id
-                        ),
+                    invalid_data!(
+                        "No schema exists with the current schema id {}.",
+                        value.current_schema_id
                     )
                 })?;
             let partition_specs = HashMap::from_iter(
@@ -944,12 +988,112 @@ pub(super) mod _serde {
                     (DEFAULT_PARTITION_SPEC_ID == default_spec_id)
                         .then(PartitionSpec::unpartition_spec)
                 })
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Default partition spec {default_spec_id} not found"),
+                .ok_or_else(|| invalid_data!("Default partition spec {default_spec_id} not found"))?
+                .into();
+            let default_partition_type = default_spec.partition_type(current_schema)?;
+
+            let mut metadata = TableMetadata {
+                format_version: FormatVersion::V3,
+                table_uuid: value.table_uuid,
+                location: value.location,
+                last_sequence_number: value.last_sequence_number,
+                last_updated_ms: value.last_updated_ms,
+                last_column_id: value.last_column_id,
+                current_schema_id: value.current_schema_id,
+                schemas,
+                partition_specs,
+                default_partition_type,
+                default_spec,
+                last_partition_id: value.last_partition_id,
+                properties: value.properties.unwrap_or_default(),
+                current_snapshot_id,
+                snapshots: snapshots
+                    .map(|snapshots| {
+                        HashMap::from_iter(
+                            snapshots
+                                .into_iter()
+                                .map(|x| (x.snapshot_id, Arc::new(x.into()))),
+                        )
+                    })
+                    .unwrap_or_default(),
+                snapshot_log: value.snapshot_log.unwrap_or_default(),
+                metadata_log: value.metadata_log.unwrap_or_default(),
+                sort_orders: HashMap::from_iter(
+                    value
+                        .sort_orders
+                        .into_iter()
+                        .map(|x| (x.order_id, Arc::new(x))),
+                ),
+                default_sort_order_id: value.default_sort_order_id,
+                refs: value.refs.unwrap_or_else(|| {
+                    if let Some(snapshot_id) = current_snapshot_id {
+                        HashMap::from_iter(vec![(MAIN_BRANCH.to_string(), SnapshotReference {
+                            snapshot_id,
+                            retention: SnapshotRetention::Branch {
+                                min_snapshots_to_keep: None,
+                                max_snapshot_age_ms: None,
+                                max_ref_age_ms: None,
+                            },
+                        })])
+                    } else {
+                        HashMap::new()
+                    }
+                }),
+                statistics: index_statistics(value.statistics),
+                partition_statistics: index_partition_statistics(value.partition_statistics),
+                encryption_keys: encryption_keys
+                    .map(|keys| {
+                        HashMap::from_iter(keys.into_iter().map(|key| (key.key_id.clone(), key)))
+                    })
+                    .unwrap_or_default(),
+                next_row_id,
+            };
+
+            metadata.borrow_mut().try_normalize()?;
+            Ok(metadata)
+        }
+    }
+
+    impl TryFrom<TableMetadataV2> for TableMetadata {
+        type Error = Error;
+        fn try_from(value: TableMetadataV2) -> Result<Self, Error> {
+            let snapshots = value.snapshots;
+            let value = value.shared;
+            let current_snapshot_id = if value.current_snapshot_id == Some(EMPTY_SNAPSHOT_ID) {
+                None
+            } else {
+                value.current_snapshot_id
+            };
+            let schemas = HashMap::from_iter(
+                value
+                    .schemas
+                    .into_iter()
+                    .map(|schema| Ok((schema.schema_id, Arc::new(schema.try_into()?))))
+                    .collect::<Result<Vec<_>, Error>>()?,
+            );
+
+            let current_schema: &SchemaRef =
+                schemas.get(&value.current_schema_id).ok_or_else(|| {
+                    invalid_data!(
+                        "No schema exists with the current schema id {}.",
+                        value.current_schema_id
                     )
-                })?
+                })?;
+            let partition_specs = HashMap::from_iter(
+                value
+                    .partition_specs
+                    .into_iter()
+                    .map(|x| (x.spec_id(), Arc::new(x))),
+            );
+            let default_spec_id = value.default_spec_id;
+            let default_spec: PartitionSpecRef = partition_specs
+                .get(&value.default_spec_id)
+                .map(|spec| (**spec).clone())
+                .or_else(|| {
+                    (DEFAULT_PARTITION_SPEC_ID == default_spec_id)
+                        .then(PartitionSpec::unpartition_spec)
+                })
+                .ok_or_else(|| invalid_data!("Default partition spec {default_spec_id} not found"))?
                 .into();
             let default_partition_type = default_spec.partition_type(current_schema)?;
 
@@ -968,8 +1112,7 @@ pub(super) mod _serde {
                 last_partition_id: value.last_partition_id,
                 properties: value.properties.unwrap_or_default(),
                 current_snapshot_id,
-                snapshots: value
-                    .snapshots
+                snapshots: snapshots
                     .map(|snapshots| {
                         HashMap::from_iter(
                             snapshots
@@ -1004,6 +1147,7 @@ pub(super) mod _serde {
                 statistics: index_statistics(value.statistics),
                 partition_statistics: index_partition_statistics(value.partition_statistics),
                 encryption_keys: HashMap::new(),
+                next_row_id: INITIAL_ROW_ID,
             };
 
             metadata.borrow_mut().try_normalize()?;
@@ -1014,7 +1158,7 @@ pub(super) mod _serde {
     impl TryFrom<TableMetadataV1> for TableMetadata {
         type Error = Error;
         fn try_from(value: TableMetadataV1) -> Result<Self, Error> {
-            let current_snapshot_id = if let &Some(-1) = &value.current_snapshot_id {
+            let current_snapshot_id = if value.current_snapshot_id == Some(EMPTY_SNAPSHOT_ID) {
                 None
             } else {
                 value.current_snapshot_id
@@ -1039,12 +1183,8 @@ pub(super) mod _serde {
                     let schema = schema_map
                         .get(&schema_id)
                         .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::DataInvalid,
-                                format!(
-                                    "No schema exists with the current schema id {}.",
-                                    schema_id
-                                ),
+                            invalid_data!(
+                                "No schema exists with the current schema id {schema_id}."
                             )
                         })?
                         .clone();
@@ -1058,9 +1198,8 @@ pub(super) mod _serde {
                     (schema_map, schema_id, schema_arc)
                 } else {
                     // Option 3: No valid schema configuration found
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "No valid schema configuration found in table metadata",
+                    return Err(invalid_data!(
+                        "No valid schema configuration found in table metadata"
                     ));
                 };
 
@@ -1073,10 +1212,14 @@ pub(super) mod _serde {
                     .collect::<HashMap<_, _>>()
             } else if let Some(partition_spec) = value.partition_spec {
                 // Option 2: Fall back to 'partition_spec'
-                let spec = PartitionSpec::builder(current_schema.clone())
-                    .with_spec_id(DEFAULT_PARTITION_SPEC_ID)
-                    .add_unbound_fields(partition_spec.into_iter().map(|f| f.into_unbound()))?
-                    .build()?;
+                let spec = UnboundPartitionSpec {
+                    spec_id: Some(DEFAULT_PARTITION_SPEC_ID),
+                    fields: partition_spec
+                        .into_iter()
+                        .map(|f| f.into_unbound())
+                        .collect(),
+                }
+                .bind(current_schema.clone())?;
 
                 HashMap::from_iter(vec![(DEFAULT_PARTITION_SPEC_ID, Arc::new(spec))])
             } else {
@@ -1097,12 +1240,7 @@ pub(super) mod _serde {
             let default_spec: PartitionSpecRef = partition_specs
                 .get(&default_spec_id)
                 .map(|x| Arc::unwrap_or_clone(x.clone()))
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Default partition spec {default_spec_id} not found"),
-                    )
-                })?
+                .ok_or_else(|| invalid_data!("Default partition spec {default_spec_id} not found"))?
                 .into();
             let default_partition_type = default_spec.partition_type(&current_schema)?;
 
@@ -1161,6 +1299,7 @@ pub(super) mod _serde {
                 statistics: index_statistics(value.statistics),
                 partition_statistics: index_partition_statistics(value.partition_statistics),
                 encryption_keys: HashMap::new(),
+                next_row_id: INITIAL_ROW_ID, // v1 has no row lineage
             };
 
             metadata.borrow_mut().try_normalize()?;
@@ -1168,10 +1307,63 @@ pub(super) mod _serde {
         }
     }
 
+    impl TryFrom<TableMetadata> for TableMetadataV3 {
+        type Error = Error;
+
+        fn try_from(mut v: TableMetadata) -> Result<Self, Self::Error> {
+            let next_row_id = v.next_row_id;
+            let encryption_keys = std::mem::take(&mut v.encryption_keys);
+            let snapshots = std::mem::take(&mut v.snapshots);
+            let shared = v.into();
+
+            Ok(TableMetadataV3 {
+                format_version: VersionNumber::<3>,
+                shared,
+                next_row_id,
+                encryption_keys: if encryption_keys.is_empty() {
+                    None
+                } else {
+                    Some(encryption_keys.into_values().collect())
+                },
+                snapshots: if snapshots.is_empty() {
+                    None
+                } else {
+                    Some(
+                        snapshots
+                            .into_values()
+                            .map(|s| SnapshotV3::try_from(Arc::unwrap_or_clone(s)))
+                            .collect::<Result<_, _>>()?,
+                    )
+                },
+            })
+        }
+    }
+
     impl From<TableMetadata> for TableMetadataV2 {
-        fn from(v: TableMetadata) -> Self {
+        fn from(mut v: TableMetadata) -> Self {
+            let snapshots = std::mem::take(&mut v.snapshots);
+            let shared = v.into();
+
             TableMetadataV2 {
                 format_version: VersionNumber::<2>,
+                shared,
+                snapshots: if snapshots.is_empty() {
+                    None
+                } else {
+                    Some(
+                        snapshots
+                            .into_values()
+                            .map(|s| SnapshotV2::from(Arc::unwrap_or_clone(s)))
+                            .collect(),
+                    )
+                },
+            }
+        }
+    }
+
+    impl From<TableMetadata> for TableMetadataV2V3Shared {
+        fn from(v: TableMetadata) -> Self {
+            TableMetadataV2V3Shared {
                 table_uuid: v.table_uuid,
                 location: v.location,
                 last_sequence_number: v.last_sequence_number,
@@ -1200,20 +1392,6 @@ pub(super) mod _serde {
                     Some(v.properties)
                 },
                 current_snapshot_id: v.current_snapshot_id,
-                snapshots: if v.snapshots.is_empty() {
-                    None
-                } else {
-                    Some(
-                        v.snapshots
-                            .into_values()
-                            .map(|x| {
-                                Arc::try_unwrap(x)
-                                    .unwrap_or_else(|snapshot| snapshot.as_ref().clone())
-                                    .into()
-                            })
-                            .collect(),
-                    )
-                },
                 snapshot_log: if v.snapshot_log.is_empty() {
                     None
                 } else {
@@ -1343,6 +1521,8 @@ pub enum FormatVersion {
     V1 = 1u8,
     /// Iceberg spec version 2
     V2 = 2u8,
+    /// Iceberg spec version 3
+    V3 = 3u8,
 }
 
 impl PartialOrd for FormatVersion {
@@ -1362,6 +1542,7 @@ impl Display for FormatVersion {
         match self {
             FormatVersion::V1 => write!(f, "v1"),
             FormatVersion::V2 => write!(f, "v2"),
+            FormatVersion::V3 => write!(f, "v3"),
         }
     }
 }
@@ -1387,7 +1568,7 @@ pub struct SnapshotLog {
 }
 
 impl SnapshotLog {
-    /// Returns the last updated timestamp as a DateTime<Utc> with millisecond precision
+    /// Returns the last updated timestamp as a [`DateTime<Utc>`] with millisecond precision
     pub fn timestamp(self) -> Result<DateTime<Utc>> {
         timestamp_ms_to_utc(self.timestamp_ms)
     }
@@ -1406,19 +1587,23 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
+    use base64::Engine as _;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::{FormatVersion, MetadataLog, SnapshotLog, TableMetadataBuilder};
-    use crate::TableCreation;
-    use crate::io::FileIOBuilder;
+    use crate::catalog::MetadataLocation;
+    use crate::compression::CompressionCodec;
+    use crate::io::FileIO;
     use crate::spec::table_metadata::TableMetadata;
     use crate::spec::{
-        BlobMetadata, NestedField, NullOrder, Operation, PartitionSpec, PartitionStatisticsFile,
-        PrimitiveType, Schema, Snapshot, SnapshotReference, SnapshotRetention, SortDirection,
-        SortField, SortOrder, StatisticsFile, Summary, Transform, Type, UnboundPartitionField,
+        BlobMetadata, EncryptedKey, INITIAL_ROW_ID, Literal, NestedField, NullOrder, Operation,
+        PartitionSpec, PartitionStatisticsFile, PrimitiveLiteral, PrimitiveType, Schema, Snapshot,
+        SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, StatisticsFile,
+        Summary, TableProperties, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
     };
+    use crate::{ErrorKind, TableCreation};
 
     fn check_table_metadata_serde(json: &str, expected_type: TableMetadata) {
         let desered_type: TableMetadata = serde_json::from_str(json).unwrap();
@@ -1431,10 +1616,20 @@ mod tests {
     }
 
     fn get_test_table_metadata(file_name: &str) -> TableMetadata {
-        let path = format!("testdata/table_metadata/{}", file_name);
+        let path = format!("testdata/table_metadata/{file_name}");
         let metadata: String = fs::read_to_string(path).unwrap();
 
         serde_json::from_str(&metadata).unwrap()
+    }
+
+    /// Loads a test table metadata and relocates it to `location`, so that derived
+    /// metadata paths point at a writable (e.g. temp) directory.
+    fn get_test_table_metadata_at(file_name: &str, location: &str) -> TableMetadata {
+        TableMetadataBuilder::new_from_metadata(get_test_table_metadata(file_name), None)
+            .set_location(location.to_string())
+            .build()
+            .unwrap()
+            .metadata
     }
 
     #[test]
@@ -1522,12 +1717,15 @@ mod tests {
 
         let partition_spec = PartitionSpec::builder(schema.clone())
             .with_spec_id(0)
-            .add_unbound_field(UnboundPartitionField {
-                name: "ts_day".to_string(),
-                transform: Transform::Day,
-                source_id: 4,
-                field_id: Some(1000),
-            })
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![4])
+                    .field_id(1000)
+                    .name("ts_day".to_string())
+                    .transform(Transform::Day)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build()
             .unwrap();
@@ -1563,6 +1761,186 @@ mod tests {
             statistics: HashMap::new(),
             partition_statistics: HashMap::new(),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
+        };
+
+        let expected_json_value = serde_json::to_value(&expected).unwrap();
+        check_table_metadata_serde(data, expected);
+
+        let json_value = serde_json::from_str::<serde_json::Value>(data).unwrap();
+        assert_eq!(json_value, expected_json_value);
+    }
+
+    #[test]
+    fn test_table_data_v3() {
+        let data = r#"
+            {
+                "format-version" : 3,
+                "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+                "location": "s3://b/wh/data.db/table",
+                "last-sequence-number" : 1,
+                "last-updated-ms": 1515100955770,
+                "last-column-id": 1,
+                "next-row-id": 5,
+                "schemas": [
+                    {
+                        "schema-id" : 1,
+                        "type" : "struct",
+                        "fields" :[
+                            {
+                                "id": 4,
+                                "name": "ts",
+                                "required": true,
+                                "type": "timestamp"
+                            }
+                        ]
+                    }
+                ],
+                "current-schema-id" : 1,
+                "partition-specs": [
+                    {
+                        "spec-id": 0,
+                        "fields": [
+                            {
+                                "source-id": 4,
+                                "field-id": 1000,
+                                "name": "ts_day",
+                                "transform": "day"
+                            }
+                        ]
+                    }
+                ],
+                "default-spec-id": 0,
+                "last-partition-id": 1000,
+                "properties": {
+                    "commit.retry.num-retries": "1"
+                },
+                "metadata-log": [
+                    {
+                        "metadata-file": "s3://bucket/.../v1.json",
+                        "timestamp-ms": 1515100
+                    }
+                ],
+                "refs": {},
+                "snapshots" : [ {
+                    "snapshot-id" : 1,
+                    "timestamp-ms" : 1662532818843,
+                    "sequence-number" : 0,
+                    "first-row-id" : 0,
+                    "added-rows" : 4,
+                    "key-id" : "key1",
+                    "summary" : {
+                        "operation" : "append"
+                    },
+                    "manifest-list" : "/home/iceberg/warehouse/nyc/taxis/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro",
+                    "schema-id" : 0
+                    }
+                ],
+                "encryption-keys": [
+                    {
+                        "key-id": "key1",
+                        "encrypted-by-id": "KMS",
+                        "encrypted-key-metadata": "c29tZS1lbmNyeXB0aW9uLWtleQ==",
+                        "properties": {
+                            "p1": "v1"
+                        }
+                    }
+                ],
+                "sort-orders": [
+                    {
+                    "order-id": 0,
+                    "fields": []
+                    }
+                ],
+                "default-sort-order-id": 0
+            }
+        "#;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                4,
+                "ts",
+                Type::Primitive(PrimitiveType::Timestamp),
+            ))])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![4])
+                    .field_id(1000)
+                    .name("ts_day".to_string())
+                    .transform(Transform::Day)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(1662532818843)
+            .with_sequence_number(0)
+            .with_row_range(0, 4)
+            .with_encryption_key_id(Some("key1".to_string()))
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_manifest_list("/home/iceberg/warehouse/nyc/taxis/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro".to_string())
+            .with_schema_id(0)
+            .build();
+
+        let encryption_key = EncryptedKey::builder()
+            .key_id("key1".to_string())
+            .encrypted_by_id("KMS".to_string())
+            .encrypted_key_metadata(
+                base64::prelude::BASE64_STANDARD
+                    .decode("c29tZS1lbmNyeXB0aW9uLWtleQ==")
+                    .unwrap(),
+            )
+            .properties(HashMap::from_iter(vec![(
+                "p1".to_string(),
+                "v1".to_string(),
+            )]))
+            .build();
+
+        let default_partition_type = partition_spec.partition_type(&schema).unwrap();
+        let expected = TableMetadata {
+            format_version: FormatVersion::V3,
+            table_uuid: Uuid::parse_str("fb072c92-a02b-11e9-ae9c-1bb7bc9eca94").unwrap(),
+            location: "s3://b/wh/data.db/table".to_string(),
+            last_updated_ms: 1515100955770,
+            last_column_id: 1,
+            schemas: HashMap::from_iter(vec![(1, Arc::new(schema))]),
+            current_schema_id: 1,
+            partition_specs: HashMap::from_iter(vec![(0, partition_spec.clone().into())]),
+            default_partition_type,
+            default_spec: partition_spec.into(),
+            last_partition_id: 1000,
+            default_sort_order_id: 0,
+            sort_orders: HashMap::from_iter(vec![(0, SortOrder::unsorted_order().into())]),
+            snapshots: HashMap::from_iter(vec![(1, snapshot.into())]),
+            current_snapshot_id: None,
+            last_sequence_number: 1,
+            properties: HashMap::from_iter(vec![(
+                "commit.retry.num-retries".to_string(),
+                "1".to_string(),
+            )]),
+            snapshot_log: Vec::new(),
+            metadata_log: vec![MetadataLog {
+                metadata_file: "s3://bucket/.../v1.json".to_string(),
+                timestamp_ms: 1515100,
+            }],
+            refs: HashMap::new(),
+            statistics: HashMap::new(),
+            partition_statistics: HashMap::new(),
+            encryption_keys: HashMap::from_iter(vec![("key1".to_string(), encryption_key)]),
+            next_row_id: 5,
         };
 
         let expected_json_value = serde_json::to_value(&expected).unwrap();
@@ -1739,6 +2117,7 @@ mod tests {
             statistics: HashMap::new(),
             partition_statistics: HashMap::new(),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         check_table_metadata_serde(data, expected);
@@ -1837,6 +2216,7 @@ mod tests {
             statistics: HashMap::new(),
             partition_statistics: HashMap::new(),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         let expected_json_value = serde_json::to_value(&expected).unwrap();
@@ -2203,7 +2583,6 @@ mod tests {
     "#;
 
         let err = serde_json::from_str::<TableMetadata>(data).unwrap_err();
-        println!("{}", err);
         assert!(err.to_string().contains(
             "Invalid snapshot with id 3055729675574597004 and sequence number 4 greater than last sequence number 1"
         ));
@@ -2372,6 +2751,7 @@ mod tests {
                 },
             })]),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         check_table_metadata_serde(data, expected);
@@ -2507,6 +2887,7 @@ mod tests {
                 },
             })]),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         check_table_metadata_serde(data, expected);
@@ -2533,6 +2914,98 @@ mod tests {
         "#;
         assert!(serde_json::from_str::<TableMetadata>(data).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn test_table_metadata_v3_valid_minimal() {
+        let metadata_str =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV3ValidMinimal.json").unwrap();
+
+        let table_metadata = serde_json::from_str::<TableMetadata>(&metadata_str).unwrap();
+        assert_eq!(table_metadata.format_version, FormatVersion::V3);
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(
+                    NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(Literal::Primitive(PrimitiveLiteral::Long(1)))
+                        .with_write_default(Literal::Primitive(PrimitiveLiteral::Long(1))),
+                ),
+                Arc::new(
+                    NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long))
+                        .with_doc("comment"),
+                ),
+                Arc::new(NestedField::required(
+                    3,
+                    "z",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .field_id(1000)
+                    .name("x".to_string())
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let sort_order = SortOrder::builder()
+            .with_order_id(3)
+            .with_sort_field(SortField {
+                source_id: 2,
+                transform: Transform::Identity,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::First,
+            })
+            .with_sort_field(SortField {
+                source_id: 3,
+                transform: Transform::Bucket(4),
+                direction: SortDirection::Descending,
+                null_order: NullOrder::Last,
+            })
+            .build_unbound()
+            .unwrap();
+
+        let default_partition_type = partition_spec.partition_type(&schema).unwrap();
+        let expected = TableMetadata {
+            format_version: FormatVersion::V3,
+            table_uuid: Uuid::parse_str("9c12d441-03fe-4693-9a96-a0705ddf69c1").unwrap(),
+            location: "s3://bucket/test/location".to_string(),
+            last_updated_ms: 1602638573590,
+            last_column_id: 3,
+            schemas: HashMap::from_iter(vec![(0, Arc::new(schema))]),
+            current_schema_id: 0,
+            partition_specs: HashMap::from_iter(vec![(0, partition_spec.clone().into())]),
+            default_spec: Arc::new(partition_spec),
+            default_partition_type,
+            last_partition_id: 1000,
+            default_sort_order_id: 3,
+            sort_orders: HashMap::from_iter(vec![(3, sort_order.into())]),
+            snapshots: HashMap::default(),
+            current_snapshot_id: None,
+            last_sequence_number: 34,
+            properties: HashMap::new(),
+            snapshot_log: Vec::new(),
+            metadata_log: Vec::new(),
+            refs: HashMap::new(),
+            statistics: HashMap::new(),
+            partition_statistics: HashMap::new(),
+            encryption_keys: HashMap::new(),
+            next_row_id: 0, // V3 specific field from the JSON
+        };
+
+        check_table_metadata_serde(&metadata_str, expected);
     }
 
     #[test]
@@ -2574,12 +3047,15 @@ mod tests {
 
         let partition_spec = PartitionSpec::builder(schema2.clone())
             .with_spec_id(0)
-            .add_unbound_field(UnboundPartitionField {
-                name: "x".to_string(),
-                transform: Transform::Identity,
-                source_id: 1,
-                field_id: Some(1000),
-            })
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .field_id(1000)
+                    .name("x".to_string())
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build()
             .unwrap();
@@ -2669,6 +3145,7 @@ mod tests {
             statistics: HashMap::new(),
             partition_statistics: HashMap::new(),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         check_table_metadata_serde(&metadata, expected);
@@ -2702,12 +3179,15 @@ mod tests {
 
         let partition_spec = PartitionSpec::builder(schema.clone())
             .with_spec_id(0)
-            .add_unbound_field(UnboundPartitionField {
-                name: "x".to_string(),
-                transform: Transform::Identity,
-                source_id: 1,
-                field_id: Some(1000),
-            })
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .field_id(1000)
+                    .name("x".to_string())
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build()
             .unwrap();
@@ -2754,6 +3234,7 @@ mod tests {
             statistics: HashMap::new(),
             partition_statistics: HashMap::new(),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         check_table_metadata_serde(&metadata, expected);
@@ -2787,12 +3268,15 @@ mod tests {
 
         let partition_spec = PartitionSpec::builder(schema.clone())
             .with_spec_id(0)
-            .add_unbound_field(UnboundPartitionField {
-                name: "x".to_string(),
-                transform: Transform::Identity,
-                source_id: 1,
-                field_id: Some(1000),
-            })
+            .add_unbound_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .field_id(1000)
+                    .name("x".to_string())
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build()
             .unwrap();
@@ -2823,9 +3307,49 @@ mod tests {
             statistics: HashMap::new(),
             partition_statistics: HashMap::new(),
             encryption_keys: HashMap::new(),
+            next_row_id: INITIAL_ROW_ID,
         };
 
         check_table_metadata_serde(&metadata, expected);
+    }
+
+    #[test]
+    fn test_table_metadata_v1_legacy_partition_spec_with_void_fields() {
+        let mut metadata: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string("testdata/table_metadata/TableMetadataV1Valid.json").unwrap(),
+        )
+        .unwrap();
+        // What a format version 1 spec keeps after identity(x) was removed twice.
+        metadata["partition-spec"] = serde_json::json!([
+            {"name": "x", "transform": "void", "source-id": 1, "field-id": 1000},
+            {"name": "x_null", "transform": "void", "source-id": 1, "field-id": 1001},
+        ]);
+
+        let metadata: TableMetadata = serde_json::from_value(metadata).unwrap();
+
+        let fields = metadata.default_partition_spec().fields();
+        assert_eq!(
+            fields
+                .iter()
+                .map(|f| (f.field_id, f.name.as_str(), f.transform))
+                .collect::<Vec<_>>(),
+            vec![
+                (1000, "x", Transform::Void),
+                (1001, "x_null", Transform::Void)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_empty_snapshot_id_is_normalized_to_none() {
+        let metadata =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV1Valid.json").unwrap();
+        let deserialized: TableMetadata = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            deserialized.current_snapshot_id(),
+            None,
+            "current_snapshot_id of -1 should be deserialized as None"
+        );
     }
 
     #[test]
@@ -2890,8 +3414,7 @@ mod tests {
         let error_message = desered.unwrap_err().to_string();
         assert!(
             error_message.contains("No valid schema configuration found"),
-            "Expected error about no valid schema configuration, got: {}",
-            error_message
+            "Expected error about no valid schema configuration, got: {error_message}"
         );
     }
 
@@ -3019,6 +3542,70 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_default_partition_spec_with_dropped_source() {
+        for version in [1, 2, 3] {
+            for transform in ["identity", "truncate[4]", "bucket[16]"] {
+                let mut metadata = serde_json::json!({
+                    "format-version": version,
+                    "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+                    "location": "s3://bucket/table",
+                    "last-sequence-number": 0,
+                    "last-updated-ms": 1602638573590_i64,
+                    "last-column-id": 2,
+                    "current-schema-id": 1,
+                    "schemas": [
+                        {
+                            "schema-id": 0,
+                            "type": "struct",
+                            "fields": [
+                                {"id": 1, "name": "x", "required": false, "type": "long"},
+                                {"id": 2, "name": "y", "required": false, "type": "long"}
+                            ]
+                        },
+                        {
+                            "schema-id": 1,
+                            "type": "struct",
+                            "fields": [
+                                {"id": 2, "name": "y", "required": false, "type": "long"}
+                            ]
+                        }
+                    ],
+                    "default-spec-id": 0,
+                    "partition-specs": [{"spec-id": 0, "fields": [{
+                        "source-id": 1, "field-id": 1000, "name": "x_partition",
+                        "transform": transform
+                    }]}],
+                    "last-partition-id": 1000,
+                    "default-sort-order-id": 0,
+                    "sort-orders": [{"order-id": 0, "fields": []}],
+                    "next-row-id": 0
+                });
+
+                // Retaining the source in history does not make it writable using
+                // the current schema and default spec.
+                let err = serde_json::from_value::<TableMetadata>(metadata.clone()).unwrap_err();
+                assert!(err.to_string().contains(
+                    "Default partition spec 0 references missing source field 1 in current schema 1"
+                ));
+
+                // The same spec is allowed once it becomes historical.
+                metadata["partition-specs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"spec-id": 1, "fields": []}));
+                metadata["default-spec-id"] = serde_json::json!(1);
+                serde_json::from_value::<TableMetadata>(metadata.clone()).unwrap();
+
+                // A voided field does not require its dropped source, even in the default spec.
+                metadata["default-spec-id"] = serde_json::json!(0);
+                metadata["partition-specs"][0]["fields"][0]["transform"] =
+                    serde_json::json!("void");
+                serde_json::from_value::<TableMetadata>(metadata).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn test_default_partition_spec() {
         let default_spec_id = 1234;
         let mut table_meta_data = get_test_table_metadata("TableMetadataV2Valid.json");
@@ -3112,13 +3699,16 @@ mod tests {
         let temp_path = temp_dir.path().to_str().unwrap();
 
         // Create a FileIO instance
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
 
         // Use an existing test metadata from the test files
-        let original_metadata: TableMetadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        let original_metadata: TableMetadata =
+            get_test_table_metadata_at("TableMetadataV2Valid.json", temp_path);
 
         // Define the metadata location
-        let metadata_location = format!("{}/metadata.json", temp_path);
+        let metadata_location =
+            MetadataLocation::try_new_with_metadata(&original_metadata).unwrap();
+        let metadata_location_str = metadata_location.to_string();
 
         // Write the metadata
         original_metadata
@@ -3127,10 +3717,34 @@ mod tests {
             .unwrap();
 
         // Verify the file exists
-        assert!(fs::metadata(&metadata_location).is_ok());
+        assert!(fs::metadata(&metadata_location_str).is_ok());
 
         // Read the metadata back
-        let read_metadata = TableMetadata::read_from(&file_io, &metadata_location)
+        let read_metadata = TableMetadata::read_from(&file_io, &metadata_location_str)
+            .await
+            .unwrap();
+
+        // Verify the metadata matches
+        assert_eq!(read_metadata, original_metadata);
+    }
+
+    #[tokio::test]
+    async fn test_table_metadata_read_compressed() {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_location = temp_dir.path().join("v1.gz.metadata.json");
+
+        let original_metadata: TableMetadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        let json = serde_json::to_string(&original_metadata).unwrap();
+
+        let compressed = CompressionCodec::gzip_default()
+            .compress(json.into_bytes())
+            .expect("failed to compress metadata");
+        fs::write(&metadata_location, &compressed).expect("failed to write metadata");
+
+        // Read the metadata back
+        let file_io = FileIO::new_with_fs();
+        let metadata_location = metadata_location.to_str().unwrap();
+        let read_metadata = TableMetadata::read_from(&file_io, metadata_location)
             .await
             .unwrap();
 
@@ -3141,7 +3755,7 @@ mod tests {
     #[tokio::test]
     async fn test_table_metadata_read_nonexistent_file() {
         // Create a FileIO instance
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
 
         // Try to read a non-existent file
         let result = TableMetadata::read_from(&file_io, "/nonexistent/path/metadata.json").await;
@@ -3150,80 +3764,62 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_partition_name_exists() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::required(2, "partition_col", Type::Primitive(PrimitiveType::Int))
-                    .into(),
-            ])
-            .build()
+    #[tokio::test]
+    async fn test_table_metadata_write_with_gzip_compression() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+        let file_io = FileIO::new_with_fs();
+
+        // Get a test metadata and add gzip compression property
+        let original_metadata: TableMetadata =
+            get_test_table_metadata_at("TableMetadataV2Valid.json", temp_path);
+
+        // Modify properties to enable gzip compression (using mixed case to test case-insensitive matching)
+        let mut props = original_metadata.properties.clone();
+        props.insert(
+            TableProperties::PROPERTY_METADATA_COMPRESSION_CODEC.to_string(),
+            "GziP".to_string(),
+        );
+        // Use builder to create new metadata with updated properties
+        let compressed_metadata =
+            TableMetadataBuilder::new_from_metadata(original_metadata.clone(), None)
+                .assign_uuid(original_metadata.table_uuid)
+                .set_properties(props.clone())
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+
+        // Create MetadataLocation with compression codec from metadata
+        let metadata_location =
+            MetadataLocation::try_new_with_metadata(&compressed_metadata).unwrap();
+        let metadata_location_str = metadata_location.to_string();
+
+        // Verify the location has the .gz extension
+        assert!(metadata_location_str.contains(".gz.metadata.json"));
+
+        // Write the metadata with compression
+        compressed_metadata
+            .write_to(&file_io, &metadata_location)
+            .await
             .unwrap();
 
-        let spec1 = PartitionSpec::builder(schema.clone())
-            .with_spec_id(1)
-            .add_partition_field("data", "data_partition", Transform::Identity)
-            .unwrap()
-            .build()
+        // Verify the compressed file exists
+        assert!(std::path::Path::new(&metadata_location_str).exists());
+
+        // Read the raw file and check it's gzip compressed
+        let raw_content = fs::read(&metadata_location_str).unwrap();
+        assert!(raw_content.len() > 2);
+        assert_eq!(raw_content[0], 0x1F); // gzip magic number
+        assert_eq!(raw_content[1], 0x8B); // gzip magic number
+
+        // Read the metadata back using the compressed location
+        let read_metadata = TableMetadata::read_from(&file_io, &metadata_location_str)
+            .await
             .unwrap();
 
-        let spec2 = PartitionSpec::builder(schema.clone())
-            .with_spec_id(2)
-            .add_partition_field("partition_col", "partition_bucket", Transform::Bucket(16))
-            .unwrap()
-            .build()
-            .unwrap();
-
-        // Build metadata with these specs
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            spec1.clone().into_unbound(),
-            SortOrder::unsorted_order(),
-            "s3://test/location".to_string(),
-            FormatVersion::V2,
-            HashMap::new(),
-        )
-        .unwrap()
-        .add_partition_spec(spec2.into_unbound())
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata;
-
-        assert!(metadata.partition_name_exists("data_partition"));
-        assert!(metadata.partition_name_exists("partition_bucket"));
-
-        assert!(!metadata.partition_name_exists("nonexistent_field"));
-        assert!(!metadata.partition_name_exists("data")); // schema field name, not partition field name
-        assert!(!metadata.partition_name_exists(""));
-    }
-
-    #[test]
-    fn test_partition_name_exists_empty_specs() {
-        // Create metadata with no partition specs (unpartitioned table)
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
-            ])
-            .build()
-            .unwrap();
-
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "s3://test/location".to_string(),
-            FormatVersion::V2,
-            HashMap::new(),
-        )
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata;
-
-        assert!(!metadata.partition_name_exists("any_field"));
-        assert!(!metadata.partition_name_exists("data"));
+        // Verify the complete round-trip: read metadata should match what we wrote
+        assert_eq!(read_metadata, compressed_metadata);
     }
 
     #[test]
@@ -3354,12 +3950,547 @@ mod tests {
             .unwrap()
             .metadata;
 
-        assert!(!final_metadata.partition_name_exists("nonexistent_partition")); // unpartitioned table
-
         assert!(final_metadata.name_exists_in_any_schema("id")); // exists in both schemas
         assert!(final_metadata.name_exists_in_any_schema("name")); // exists in both schemas
         assert!(final_metadata.name_exists_in_any_schema("deprecated_field")); // exists in both schemas
         assert!(final_metadata.name_exists_in_any_schema("new_field")); // only in current schema
         assert!(!final_metadata.name_exists_in_any_schema("never_existed"));
+    }
+
+    #[test]
+    fn test_invalid_sort_order_id_zero_with_fields() {
+        let metadata = r#"
+        {
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "s3://bucket/test/location",
+            "last-sequence-number": 111,
+            "last-updated-ms": 1600000000000,
+            "last-column-id": 3,
+            "current-schema-id": 1,
+            "schemas": [
+                {
+                    "type": "struct",
+                    "schema-id": 1,
+                    "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"},
+                        {"id": 2, "name": "y", "required": true, "type": "long"}
+                    ]
+                }
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "default-sort-order-id": 0,
+            "sort-orders": [
+                {
+                    "order-id": 0,
+                    "fields": [
+                        {
+                            "transform": "identity",
+                            "source-id": 1,
+                            "direction": "asc",
+                            "null-order": "nulls-first"
+                        }
+                    ]
+                }
+            ],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }
+        "#;
+
+        let result: Result<TableMetadata, serde_json::Error> = serde_json::from_str(metadata);
+
+        // Should fail because sort order ID 0 is reserved for unsorted order and cannot have fields
+        assert!(
+            result.is_err(),
+            "Parsing should fail for sort order ID 0 with fields"
+        );
+    }
+
+    #[test]
+    fn test_table_properties_with_defaults() {
+        use crate::spec::TableProperties;
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "s3://test/location".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let props = metadata.table_properties();
+
+        assert_eq!(
+            props.commit_num_retries().unwrap(),
+            TableProperties::PROPERTY_COMMIT_NUM_RETRIES_DEFAULT
+        );
+        assert_eq!(
+            props.write_target_file_size_bytes().unwrap(),
+            TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT
+        );
+    }
+
+    #[test]
+    fn test_table_properties_with_custom_values() {
+        use crate::spec::TableProperties;
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let properties = HashMap::from([
+            (
+                TableProperties::PROPERTY_COMMIT_NUM_RETRIES.to_string(),
+                "10".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
+                "1024".to_string(),
+            ),
+        ]);
+
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "s3://test/location".to_string(),
+            FormatVersion::V2,
+            properties,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let props = metadata.table_properties();
+
+        assert_eq!(props.commit_num_retries().unwrap(), 10);
+        assert_eq!(props.write_target_file_size_bytes().unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_deserialize_metadata_defers_invalid_table_property_errors() {
+        let invalid_retries = "not_a_number";
+        let invalid_codec = "unknown";
+        let target_file_size = "1024";
+
+        for file_name in [
+            "TableMetadataV1Valid.json",
+            "TableMetadataV2ValidMinimal.json",
+            "TableMetadataV3ValidMinimal.json",
+        ] {
+            let path = format!("testdata/table_metadata/{file_name}");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            json["properties"] = serde_json::json!({
+                (TableProperties::PROPERTY_COMMIT_NUM_RETRIES): invalid_retries,
+                (TableProperties::PROPERTY_METADATA_COMPRESSION_CODEC): invalid_codec,
+                (TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES): target_file_size,
+            });
+
+            let metadata: TableMetadata = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                metadata
+                    .properties()
+                    .get(TableProperties::PROPERTY_COMMIT_NUM_RETRIES)
+                    .map(String::as_str),
+                Some(invalid_retries)
+            );
+
+            let table_properties = metadata.table_properties();
+            let error = table_properties.commit_num_retries().unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .contains(TableProperties::PROPERTY_COMMIT_NUM_RETRIES)
+            );
+            assert_eq!(
+                table_properties.write_target_file_size_bytes().unwrap(),
+                1024
+            );
+            let error = table_properties.metadata_compression_codec().unwrap_err();
+            assert!(
+                format!("{error}").contains(TableProperties::PROPERTY_METADATA_COMPRESSION_CODEC)
+            );
+
+            let serialized = serde_json::to_value(metadata).unwrap();
+            assert_eq!(
+                serialized["properties"][TableProperties::PROPERTY_COMMIT_NUM_RETRIES],
+                invalid_retries
+            );
+            assert_eq!(
+                serialized["properties"][TableProperties::PROPERTY_METADATA_COMPRESSION_CODEC],
+                invalid_codec
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_properties_with_invalid_value() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let properties = HashMap::from([
+            (
+                TableProperties::PROPERTY_COMMIT_NUM_RETRIES.to_string(),
+                "not_a_number".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
+                "1024".to_string(),
+            ),
+        ]);
+
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "s3://test/location".to_string(),
+            FormatVersion::V2,
+            properties,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        let table_properties = metadata.table_properties();
+        let err = table_properties.commit_num_retries().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains(TableProperties::PROPERTY_COMMIT_NUM_RETRIES)
+        );
+        assert_eq!(
+            table_properties.write_target_file_size_bytes().unwrap(),
+            1024
+        );
+    }
+
+    #[test]
+    fn test_v2_to_v3_upgrade_preserves_existing_snapshots_without_row_lineage() {
+        // Create a v2 table metadata
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let v2_metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "s3://bucket/test/location".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        // Add a v2 snapshot
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(v2_metadata.last_updated_ms + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("s3://bucket/test/metadata/snap-1.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from([(
+                    "added-data-files".to_string(),
+                    "1".to_string(),
+                )]),
+            })
+            .build();
+
+        let v2_with_snapshot = v2_metadata
+            .into_builder(Some("s3://bucket/test/metadata/v00001.json".to_string()))
+            .add_snapshot(snapshot)
+            .unwrap()
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Verify v2 serialization works fine
+        let v2_json = serde_json::to_string(&v2_with_snapshot);
+        assert!(v2_json.is_ok(), "v2 serialization should work");
+
+        // Upgrade to v3
+        let v3_metadata = v2_with_snapshot
+            .into_builder(Some("s3://bucket/test/metadata/v00002.json".to_string()))
+            .upgrade_format_version(FormatVersion::V3)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        assert_eq!(v3_metadata.format_version, FormatVersion::V3);
+        assert_eq!(v3_metadata.next_row_id, INITIAL_ROW_ID);
+        assert_eq!(v3_metadata.snapshots.len(), 1);
+
+        // Verify the snapshot has no row_range
+        let snapshot = v3_metadata.snapshots.values().next().unwrap();
+        assert!(
+            snapshot.row_range().is_none(),
+            "Snapshot should have no row_range after upgrade"
+        );
+
+        // Try to serialize v3 metadata - this should now work
+        let v3_json = serde_json::to_string(&v3_metadata);
+        assert!(
+            v3_json.is_ok(),
+            "v3 serialization should work for upgraded tables"
+        );
+
+        // Verify we can deserialize it back
+        let deserialized: TableMetadata = serde_json::from_str(&v3_json.unwrap()).unwrap();
+        assert_eq!(deserialized.format_version, FormatVersion::V3);
+        assert_eq!(deserialized.snapshots.len(), 1);
+
+        // Verify the deserialized snapshot still has no row_range
+        let deserialized_snapshot = deserialized.snapshots.values().next().unwrap();
+        assert!(
+            deserialized_snapshot.row_range().is_none(),
+            "Deserialized snapshot should have no row_range"
+        );
+    }
+
+    #[test]
+    fn test_v3_snapshot_with_row_lineage_serialization() {
+        // Create a v3 table metadata
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let v3_metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "s3://bucket/test/location".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        // Add a v3 snapshot with row lineage
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(v3_metadata.last_updated_ms + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("s3://bucket/test/metadata/snap-1.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from([(
+                    "added-data-files".to_string(),
+                    "1".to_string(),
+                )]),
+            })
+            .with_row_range(100, 50) // first_row_id=100, added_rows=50
+            .build();
+
+        let v3_with_snapshot = v3_metadata
+            .into_builder(Some("s3://bucket/test/metadata/v00001.json".to_string()))
+            .add_snapshot(snapshot)
+            .unwrap()
+            .set_ref("main", SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        // Verify the snapshot has row_range
+        let snapshot = v3_with_snapshot.snapshots.values().next().unwrap();
+        assert!(
+            snapshot.row_range().is_some(),
+            "Snapshot should have row_range"
+        );
+        let (first_row_id, added_rows) = snapshot.row_range().unwrap();
+        assert_eq!(first_row_id, 100);
+        assert_eq!(added_rows, 50);
+
+        // Serialize v3 metadata - this should work
+        let v3_json = serde_json::to_string(&v3_with_snapshot);
+        assert!(
+            v3_json.is_ok(),
+            "v3 serialization should work for snapshots with row lineage"
+        );
+
+        // Verify we can deserialize it back
+        let deserialized: TableMetadata = serde_json::from_str(&v3_json.unwrap()).unwrap();
+        assert_eq!(deserialized.format_version, FormatVersion::V3);
+        assert_eq!(deserialized.snapshots.len(), 1);
+
+        // Verify the deserialized snapshot has the correct row_range
+        let deserialized_snapshot = deserialized.snapshots.values().next().unwrap();
+        assert!(
+            deserialized_snapshot.row_range().is_some(),
+            "Deserialized snapshot should have row_range"
+        );
+        let (deserialized_first_row_id, deserialized_added_rows) =
+            deserialized_snapshot.row_range().unwrap();
+        assert_eq!(deserialized_first_row_id, 100);
+        assert_eq!(deserialized_added_rows, 50);
+    }
+
+    #[test]
+    fn test_metadata_location_default() {
+        // Verify metadata files go to `<location>/metadata` when `write.metadata.path` is not set
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json");
+        assert_eq!(metadata.location(), "s3://bucket/test/location");
+        assert_eq!(
+            metadata.metadata_location().unwrap(),
+            "s3://bucket/test/location/metadata"
+        );
+    }
+
+    #[test]
+    fn test_metadata_location_honors_write_metadata_path() {
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json")
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                TableProperties::PROPERTY_WRITE_METADATA_PATH.to_string(),
+                "s3://other-bucket/custom-meta".to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata.metadata_location().unwrap(),
+            "s3://other-bucket/custom-meta"
+        );
+    }
+
+    #[test]
+    fn test_metadata_location_trims_trailing_slash() {
+        // A configured path with a trailing slash must not yield a doubled separator
+        let metadata = get_test_table_metadata("TableMetadataV2Valid.json")
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                TableProperties::PROPERTY_WRITE_METADATA_PATH.to_string(),
+                "s3://other-bucket/custom-meta/".to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            metadata.metadata_location().unwrap(),
+            "s3://other-bucket/custom-meta"
+        );
+    }
+
+    #[test]
+    fn test_unified_partition_type_spans_all_specs() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "y", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(3, "z", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let metadata = TableMetadataBuilder::new(
+            schema.clone(),
+            UnboundPartitionSpec::builder()
+                .with_spec_id(0)
+                .add_partition_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![2])
+                        .name("y")
+                        .transform(Transform::Identity)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap()
+                .build(),
+            SortOrder::unsorted_order(),
+            "s3://bucket/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+        .into_builder(None)
+        .add_partition_spec(
+            UnboundPartitionSpec::builder()
+                .add_partition_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![3])
+                        .name("z")
+                        .transform(Transform::Identity)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap()
+                .build(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+
+        // The default spec only knows about `y`, but `_partition` must expose both.
+        assert_eq!(metadata.default_partition_type().fields().len(), 1);
+
+        let unified = metadata.unified_partition_type(&schema).unwrap();
+        let names: Vec<&str> = unified
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["y", "z"]);
     }
 }

@@ -20,6 +20,7 @@ edition = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
 name = "iceberg-examples"
+publish = false
 repository = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -28,6 +29,7 @@ version = { workspace = true }
 futures = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 
 [[example]]
@@ -39,10 +41,17 @@ name = "rest-catalog-table"
 path = "src/rest_catalog_table.rs"
 
 [[example]]
+name = "rest-session-catalog-namespace"
+path = "src/rest_session_catalog_namespace.rs"
+
+[[example]]
 name = "oss-backend"
 path = "src/oss_backend.rs"
 required-features = ["storage-oss"]
 
 [features]
 default = []
-storage-oss = ["iceberg/storage-oss"]
+storage-oss = ["iceberg-storage-opendal/opendal-oss"]
+
+[lints]
+workspace = true
