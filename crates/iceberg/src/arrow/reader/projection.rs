@@ -4121,6 +4121,9 @@ message schema {
     }
 
     #[test]
+    // Datadog Arrow 59 backport: parquet 59 cannot project around the `ListView`
+    // columns in this fixture; upstream's behaviour needs parquet 60.
+    #[ignore = "requires parquet 60 ListView projection (Arrow 59 backport)"]
     fn test_projection_mask_reads_one_presence_leaf() {
         // `s` is struct<6: b list<7: int>, w struct<14: int>, 8: u struct<16: uint64, 5: a int>,
         // 3: c int>, and the table replaced every child. Presence must be `u.a`: the first
