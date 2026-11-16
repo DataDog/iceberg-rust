@@ -116,20 +116,15 @@ impl ArrowReader {
         field_id_map: &HashMap<i32, usize>,
         snapshot_schema: &Schema,
     ) -> Result<Option<RowSelection>> {
-        let Some(page_index) = parquet_metadata.page_index() else {
-            tracing::debug!("PageIndex was absent while reading this file");
+        let Some(column_index) = parquet_metadata.column_index() else {
+            tracing::debug!("ColumnIndex was absent while reading this file");
             return Ok(None);
         };
 
-        if !page_index.has_column_indexes() {
-            tracing::debug!("ColumnIndex was absent while reading this file");
-            return Ok(None);
-        }
-
-        if !page_index.has_offset_indexes() {
+        let Some(offset_index) = parquet_metadata.offset_index() else {
             tracing::debug!("OffsetIndex was absent while reading this file");
             return Ok(None);
-        }
+        };
 
         // If all row groups were filtered out, return an empty RowSelection (select no rows)
         //
@@ -141,8 +136,14 @@ impl ArrowReader {
 
         let mut selected_row_groups_idx = 0;
 
+        let page_index = column_index
+            .iter()
+            .enumerate()
+            .zip(offset_index)
+            .zip(parquet_metadata.row_groups());
+
         let mut results = Vec::new();
-        for (idx, row_group_metadata) in parquet_metadata.row_groups().iter().enumerate() {
+        for (((idx, column_index), offset_index), row_group_metadata) in page_index {
             if let Some(selected_row_groups) = selected_row_groups {
                 // skip row groups that aren't present in selected_row_groups
                 if idx == selected_row_groups[selected_row_groups_idx] {
@@ -154,7 +155,8 @@ impl ArrowReader {
 
             let selections_for_page = PageIndexEvaluator::eval(
                 predicate,
-                &parquet_metadata.page_index_for_row_group(idx),
+                column_index,
+                offset_index,
                 row_group_metadata,
                 field_id_map,
                 snapshot_schema,
@@ -233,7 +235,6 @@ mod tests {
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
-    use parquet::file::metadata::page_index::PageIndexProvider;
     use parquet::file::metadata::{FileMetaData, ParquetMetaData, ParquetMetaDataBuilder};
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::schema::parser::parse_message_type;
@@ -957,52 +958,13 @@ mod tests {
         Arc::new(ParquetMetaDataBuilder::new(file_meta).build())
     }
 
-    #[derive(Debug)]
-    struct TestPageIndexProvider {
-        has_column_indexes: bool,
-        has_offset_indexes: bool,
-    }
-
-    impl PageIndexProvider for TestPageIndexProvider {
-        fn has_offset_indexes(&self) -> bool {
-            self.has_offset_indexes
-        }
-
-        fn has_column_indexes(&self) -> bool {
-            self.has_column_indexes
-        }
-
-        fn column_index(
-            &self,
-            _: usize,
-            _: usize,
-        ) -> Option<&parquet::file::page_index::column_index::ColumnIndexMetaData> {
-            None
-        }
-
-        fn offset_index(
-            &self,
-            _: usize,
-            _: usize,
-        ) -> Option<&parquet::file::page_index::offset_index::OffsetIndexMetaData> {
-            None
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
     fn metadata_column_index_only() -> Arc<ParquetMetaData> {
         let msg_type = parse_message_type("message schema { REQUIRED INT32 x; }").unwrap();
         let schema_desc = Arc::new(SchemaDescriptor::new(Arc::new(msg_type)));
         let file_meta = FileMetaData::new(2, 0, None, None, schema_desc, None);
         Arc::new(
             ParquetMetaDataBuilder::new(file_meta)
-                .set_page_index(Some(Arc::new(TestPageIndexProvider {
-                    has_column_indexes: true,
-                    has_offset_indexes: false,
-                })))
+                .set_column_index(Some(vec![]))
                 .build(),
         )
     }
@@ -1013,10 +975,8 @@ mod tests {
         let file_meta = FileMetaData::new(2, 0, None, None, schema_desc, None);
         Arc::new(
             ParquetMetaDataBuilder::new(file_meta)
-                .set_page_index(Some(Arc::new(TestPageIndexProvider {
-                    has_column_indexes: true,
-                    has_offset_indexes: true,
-                })))
+                .set_column_index(Some(vec![]))
+                .set_offset_index(Some(vec![]))
                 .build(),
         )
     }
@@ -1131,9 +1091,7 @@ mod tests {
             let opts = ReadOptionsBuilder::new().with_page_index().build();
             let rdr = SerializedFileReader::new_with_options(f, opts).unwrap();
             assert!(
-                rdr.metadata()
-                    .page_index()
-                    .is_some_and(|page_index| page_index.has_column_indexes()),
+                rdr.metadata().column_index().is_some(),
                 "fixture must carry a column index so the page-index path runs"
             );
         }
@@ -1418,9 +1376,13 @@ mod tests {
             let f = File::open(&file_path).unwrap();
             let rdr = SerializedFileReader::new(f).unwrap();
             assert!(
-                rdr.metadata().page_index().is_none(),
+                rdr.metadata().column_index().is_none(),
                 "test fixture must produce a file without a column index"
             );
+            assert!(
+                rdr.metadata().offset_index().is_none(),
+                "test fixture must a product a file without offset index"
+            )
         }
 
         // Predicate: id > 2
