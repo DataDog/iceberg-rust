@@ -1345,7 +1345,7 @@ mod tests {
             .select_all()
             .build()
             .expect("scan to be valid (snapshot exists, schema is OK)")
-            .to_arrow(Default::default())
+            .to_arrow()
             .await
             .expect("scan tasks should be OK")
             .try_collect()

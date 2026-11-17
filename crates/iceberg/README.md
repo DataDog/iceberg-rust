@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         .scan()
         .select(["name", "id"])
         .build()?
-        .to_arrow(Default::default())
+        .to_arrow()
         .await?;
 
     // Consume this stream like arrow record batch stream.

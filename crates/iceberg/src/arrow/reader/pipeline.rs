@@ -65,23 +65,19 @@ impl ArrowReader {
     /// Take a stream of FileScanTasks and reads all the files.
     /// Returns a [`ScanResult`] containing the record batch stream and scan metrics.
     pub fn read(self, tasks: FileScanTaskStream) -> Result<ScanResult> {
-        let concurrency_limit_data_files = self
-            .options
-            .data_file_concurrency_limit()
-            .expect("reader construction sets concurrency")
-            .max(1);
+        let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let scan_metrics = ScanMetrics::new();
 
         let task_reader = FileScanTaskReader {
-            batch_size: self.options.batch_size(),
+            batch_size: self.batch_size,
             file_io: self.file_io,
             delete_file_loader: self
                 .delete_file_loader
                 .with_scan_metrics(scan_metrics.clone()),
-            row_group_filtering_enabled: self.options.row_group_filtering_enabled(),
-            row_selection_enabled: self.options.row_selection_enabled(),
-            bloom_filter_enabled: self.options.bloom_filter_enabled(),
-            parquet_read_options: self.options.parquet_options().clone(),
+            row_group_filtering_enabled: self.row_group_filtering_enabled,
+            row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
+            parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
             runtime: self.runtime,
         };
@@ -162,6 +158,8 @@ impl FileScanTaskReader {
 
         let should_load_page_index = (self.row_selection_enabled && task.predicate().is_some())
             || !task.deletes().is_empty();
+        let mut parquet_read_options = self.parquet_read_options;
+        parquet_read_options.preload_page_index = should_load_page_index;
 
         let delete_filter_rx = self
             .delete_file_loader
@@ -176,10 +174,6 @@ impl FileScanTaskReader {
         let file_size_in_bytes = task.file_size_in_bytes();
         let bytes_read = Arc::clone(self.scan_metrics.bytes_read_counter());
         let key_metadata = task.key_metadata().map(|km| km.to_vec());
-        let parquet_read_options = self
-            .parquet_read_options
-            .clone()
-            .with_preload_page_index(should_load_page_index);
         let opening = self
             .runtime
             .io()
@@ -916,8 +910,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::Runtime;
+    use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::test_utils::write_encrypted_parquet;
-    use crate::arrow::{ArrowReaderBuilder, ArrowReaderOptions as ReaderOptions};
     use crate::io::FileIO;
     use crate::metadata_columns::{
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
@@ -953,11 +947,7 @@ mod tests {
     ) -> crate::Result<Vec<RecordBatch>> {
         let tasks = futures::stream::iter(tasks.into_iter().map(Ok));
         ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_options(
-                ReaderOptions::builder()
-                    .with_data_file_concurrency_limit(concurrency)
-                    .build(),
-            )
+            .with_data_file_concurrency_limit(concurrency)
             .build()
             .read(Box::pin(tasks))?
             .stream()
@@ -2446,11 +2436,7 @@ mod tests {
 
         // Row selection must be enabled for the predicate to produce a RowSelection.
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_options(
-                ReaderOptions::builder()
-                    .with_row_selection_enabled(true)
-                    .build(),
-            )
+            .with_row_selection_enabled(true)
             .build();
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         let batches: Vec<RecordBatch> = reader
@@ -2491,11 +2477,7 @@ mod tests {
         );
 
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_options(
-                ReaderOptions::builder()
-                    .with_row_selection_enabled(true)
-                    .build(),
-            )
+            .with_row_selection_enabled(true)
             .build();
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         let batches: Vec<RecordBatch> = reader
@@ -2846,11 +2828,7 @@ mod tests {
 
         // Read with concurrency=1 (fast-path)
         let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
-            .with_options(
-                ReaderOptions::builder()
-                    .with_data_file_concurrency_limit(1)
-                    .build(),
-            )
+            .with_data_file_concurrency_limit(1)
             .build();
 
         // Create tasks in a specific order: file_0, file_1, file_2
@@ -3682,11 +3660,7 @@ mod tests {
         // reads `id` for its own evaluation even though `id` is not projected; the surviving
         // rows must keep their ABSOLUTE positions (0 and 2), not renumbered (0 and 1).
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_options(
-                ReaderOptions::builder()
-                    .with_row_selection_enabled(true)
-                    .build(),
-            )
+            .with_row_selection_enabled(true)
             .build();
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         let batches: Vec<RecordBatch> = reader
@@ -4089,7 +4063,6 @@ mod tests {
 
         use super::*;
         use crate::Result;
-        use crate::arrow::ParquetReadOptions;
         use crate::arrow::scan_metrics::ScanMetrics;
         use crate::expr::{Bind, Predicate, Reference};
         use crate::io::{
@@ -4274,17 +4247,9 @@ mod tests {
             let file_io = FileIOBuilder::new(Arc::new(DeferredStorageFactory { storage })).build();
 
             let reader = ArrowReaderBuilder::new(file_io, Runtime::current())
-                .with_options(
-                    ReaderOptions::builder()
-                        .with_data_file_concurrency_limit(CONCURRENCY)
-                        .with_bloom_filter_enabled(bound.is_some())
-                        .with_parquet_options(
-                            ParquetReadOptions::builder()
-                                .with_metadata_size_hint(METADATA_SIZE_HINT)
-                                .build(),
-                        )
-                        .build(),
-                )
+                .with_data_file_concurrency_limit(CONCURRENCY)
+                .with_metadata_size_hint(METADATA_SIZE_HINT)
+                .with_bloom_filter_enabled(bound.is_some())
                 .build();
             let tasks =
                 Box::pin(futures::stream::iter(tasks.into_iter().map(Ok))) as FileScanTaskStream;
