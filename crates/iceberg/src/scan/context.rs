@@ -218,7 +218,7 @@ impl ManifestEntryContext {
                 if delete.is_deletion_vector() {
                     delete.content_size_in_bytes().unwrap_or(0)
                 } else {
-                    delete.file_size_in_bytes().unwrap_or(0)
+                    delete.file_size_in_bytes()
                 }
             })
             .sum::<u64>();
