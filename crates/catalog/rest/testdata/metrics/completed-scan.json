@@ -1,0 +1,93 @@
+{
+  "report-type": "scan-report",
+  "table-name": "ns1.test1",
+  "snapshot-id": 3497810964824022504,
+  "schema-id": 0,
+  "projected-field-ids": [
+    1,
+    2
+  ],
+  "projected-field-names": [
+    "id",
+    "data"
+  ],
+  "filter": {
+    "type": "gt",
+    "term": "id",
+    "value": "(redacted)"
+  },
+  "metrics": {
+    "total-data-manifests": {
+      "unit": "count",
+      "value": 1
+    },
+    "total-delete-manifests": {
+      "unit": "count",
+      "value": 1
+    },
+    "scanned-data-manifests": {
+      "unit": "count",
+      "value": 1
+    },
+    "scanned-delete-manifests": {
+      "unit": "count",
+      "value": 1
+    },
+    "skipped-data-manifests": {
+      "unit": "count",
+      "value": 0
+    },
+    "skipped-delete-manifests": {
+      "unit": "count",
+      "value": 0
+    },
+    "result-data-files": {
+      "unit": "count",
+      "value": 2
+    },
+    "result-delete-files": {
+      "unit": "count",
+      "value": 2
+    },
+    "skipped-data-files": {
+      "unit": "count",
+      "value": 0
+    },
+    "skipped-delete-files": {
+      "unit": "count",
+      "value": 0
+    },
+    "indexed-delete-files": {
+      "unit": "count",
+      "value": 1
+    },
+    "equality-delete-files": {
+      "unit": "count",
+      "value": 1
+    },
+    "positional-delete-files": {
+      "unit": "count",
+      "value": 0
+    },
+    "dvs": {
+      "unit": "count",
+      "value": 0
+    },
+    "total-file-size-in-bytes": {
+      "unit": "bytes",
+      "value": 59
+    },
+    "total-delete-file-size-in-bytes": {
+      "unit": "bytes",
+      "value": 22
+    },
+    "total-planning-duration": {
+      "time-unit": "nanoseconds",
+      "count": 1,
+      "total-duration": 123456789
+    }
+  },
+  "metadata": {
+    "query-id": "test-query"
+  }
+}

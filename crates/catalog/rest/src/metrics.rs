@@ -16,14 +16,107 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use std::time::Duration;
 
 use iceberg::expr::{Predicate, PredicateOperator};
-use iceberg::metrics::{ScanMetrics, ScanReport};
+use iceberg::metrics::{MetricsReport, MetricsReporter, ScanMetrics, ScanReport};
 use iceberg::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, SchemaId, Type};
+use reqwest::{Method, StatusCode};
 use serde::ser::{Error, SerializeStruct};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+
+use crate::auth::AuthSession;
+use crate::client::HttpClient;
+use crate::request::HttpRequest;
+
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) struct RestMetricsReporter {
+    pub(crate) http_client: HttpClient,
+    pub(crate) catalog_session: Arc<dyn AuthSession>,
+    pub(crate) endpoint: String,
+}
+
+impl Debug for RestMetricsReporter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestMetricsReporter")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl MetricsReporter for RestMetricsReporter {
+    async fn report(&self, report: &MetricsReport) {
+        let MetricsReport::Scan(report) = report else {
+            return;
+        };
+        let mut request = ReportMetricsRequest::from(report);
+        request.filter = request.filter.as_ref().map(redact_predicate);
+        self.submit(&request).await;
+    }
+}
+
+impl RestMetricsReporter {
+    async fn submit(&self, request: &ReportMetricsRequest) {
+        match tokio::time::timeout(DELIVERY_TIMEOUT, self.deliver(request)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "REST metrics delivery failed"),
+            Err(_) => tracing::warn!("REST metrics delivery timed out"),
+        }
+    }
+
+    async fn deliver(&self, report: &ReportMetricsRequest) -> iceberg::Result<()> {
+        let request = HttpRequest::build(
+            self.http_client
+                .request(Method::POST, &self.endpoint)
+                .json(report),
+        )?;
+        let response = self
+            .http_client
+            .query_catalog(self.catalog_session.as_ref(), request)
+            .await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "REST metrics request failed",
+            )
+            .with_context("status", response.status().to_string()));
+        }
+        Ok(())
+    }
+}
+
+fn redact_predicate(predicate: &Predicate) -> Predicate {
+    use iceberg::expr::{BinaryExpression, SetExpression};
+    match predicate {
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse | Predicate::Unary(_) => predicate.clone(),
+        Predicate::And(expr) => {
+            let [a, b] = expr.inputs();
+            redact_predicate(a).and(redact_predicate(b))
+        }
+        Predicate::Or(expr) => {
+            let [a, b] = expr.inputs();
+            redact_predicate(a).or(redact_predicate(b))
+        }
+        Predicate::Not(expr) => !redact_predicate(expr.inputs()[0]),
+        Predicate::Binary(expr) => Predicate::Binary(BinaryExpression::new(
+            expr.op(),
+            expr.term().clone(),
+            Datum::string("(redacted)"),
+        )),
+        Predicate::Set(expr) => Predicate::Set(SetExpression::new(
+            expr.op(),
+            expr.term().clone(),
+            expr.literals()
+                .iter()
+                .map(|_| Datum::string("(redacted)"))
+                .collect(),
+        )),
+    }
+}
 
 /// A metrics report request for the Iceberg REST catalog.
 ///
@@ -332,6 +425,85 @@ mod tests {
                 dvs: 16,
             },
         }
+    }
+
+    #[test]
+    fn test_redacted_filter() {
+        let predicate = Reference::new("secret")
+            .equal_to(Datum::string("private"))
+            .and(!Reference::new("ids").is_in([Datum::int(10), Datum::int(20)]))
+            .or(Reference::new("value").is_null());
+        let expected = json!({"type":"or", "left":{"type":"and",
+            "left":{"type":"eq","term":"secret","value":"(redacted)"},
+            "right":{"type":"not","child":{"type":"in","term":"ids","values":["(redacted)"]}}},
+            "right":{"type":"is-null","term":"value"}});
+        assert_eq!(
+            serde_json::to_value(RestPredicate(&redact_predicate(&predicate))).unwrap(),
+            expected
+        );
+        assert!(format!("{predicate}").contains("private"));
+    }
+
+    async fn reporter(endpoint: String, session: Arc<dyn AuthSession>) -> RestMetricsReporter {
+        RestMetricsReporter {
+            http_client: HttpClient::new(
+                &crate::catalog::RestCatalogConfig::builder()
+                    .uri(endpoint.clone())
+                    .build(),
+            )
+            .unwrap(),
+            catalog_session: session,
+            endpoint,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delivery_statuses_and_no_retries() {
+        for status in [204, 400, 401, 403, 404, 405, 429, 500, 501, 503] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("POST", "/metrics")
+                .with_status(status)
+                .with_body("not JSON")
+                .expect(1)
+                .create_async()
+                .await;
+            let reporter = reporter(
+                format!("{}/metrics", server.url()),
+                Arc::new(crate::auth::NoopSession),
+            )
+            .await;
+            assert_eq!(
+                reporter.deliver(&scan_report()).await.is_ok(),
+                status == 204
+            );
+            request.assert_async().await;
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingSession;
+
+    #[async_trait::async_trait]
+    impl AuthSession for PendingSession {
+        async fn authenticate(&self, _: &mut HttpRequest) -> iceberg::Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delivery_timeout_includes_authentication() {
+        let reporter = reporter(
+            "http://127.0.0.1:1/metrics".into(),
+            Arc::new(PendingSession),
+        )
+        .await;
+        tokio::time::timeout(
+            DELIVERY_TIMEOUT + Duration::from_secs(2),
+            reporter.submit(&scan_report()),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

@@ -99,7 +99,6 @@ pub use request::{HttpRequest, HttpRequestBody};
 mod response;
 pub use response::HttpResponse;
 mod endpoint;
-#[allow(dead_code, reason = "REST metrics delivery is not wired yet.")]
 mod metrics;
 mod types;
 
