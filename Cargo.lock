@@ -3037,6 +3037,7 @@ dependencies = [
  "itertools 0.13.0",
  "mockito",
  "moka",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_derive",

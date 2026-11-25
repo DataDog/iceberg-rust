@@ -44,6 +44,7 @@ http = { workspace = true }
 iceberg = { workspace = true }
 itertools = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
+regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }

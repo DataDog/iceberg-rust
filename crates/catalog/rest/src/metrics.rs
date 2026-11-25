@@ -20,6 +20,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 
+use iceberg::TableIdent;
 use iceberg::expr::{Predicate, PredicateOperator};
 use iceberg::metrics::{MetricsReport, MetricsReporter, ScanMetrics, ScanReport};
 use iceberg::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, SchemaId, Type};
@@ -35,10 +36,14 @@ use crate::request::HttpRequest;
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+mod sanitize;
+use sanitize::redact_predicate;
+
 pub(crate) struct RestMetricsReporter {
-    pub(crate) http_client: HttpClient,
-    pub(crate) contextual_session: Arc<dyn AuthSession>,
-    pub(crate) config: RestCatalogConfig,
+    table_ident: TableIdent,
+    http_client: HttpClient,
+    contextual_session: Arc<dyn AuthSession>,
+    endpoint: String,
 }
 
 impl Debug for RestMetricsReporter {
@@ -54,29 +59,51 @@ impl MetricsReporter for RestMetricsReporter {
         let MetricsReport::Scan(report) = report else {
             return;
         };
-        let endpoint = format!(
-            "{}/metrics",
-            self.config.table_endpoint(report.table_ident())
-        );
+        if report.table_ident() != &self.table_ident {
+            tracing::warn!("Ignoring REST metrics report for a different table");
+            return;
+        }
         let mut request = ReportMetricsRequest::from(report);
-        request.filter = request.filter.as_ref().map(redact_predicate);
-        self.submit(&endpoint, &request).await;
+        if let Some(predicate) = report.filter() {
+            match redact_predicate(predicate, chrono::Utc::now()) {
+                Ok(filter) => request.filter = Some(ReportFilter::Sanitized(filter)),
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), "REST metrics filter sanitization failed");
+                    return;
+                }
+            }
+        }
+        self.submit(&request).await;
     }
 }
 
 impl RestMetricsReporter {
-    async fn submit(&self, endpoint: &str, request: &ReportMetricsRequest) {
-        match tokio::time::timeout(DELIVERY_TIMEOUT, self.deliver(endpoint, request)).await {
+    pub(crate) fn new(
+        table_ident: &TableIdent,
+        config: &RestCatalogConfig,
+        http_client: HttpClient,
+        contextual_session: Arc<dyn AuthSession>,
+    ) -> Self {
+        Self {
+            table_ident: table_ident.clone(),
+            http_client,
+            contextual_session,
+            endpoint: format!("{}/metrics", config.table_endpoint(table_ident)),
+        }
+    }
+
+    async fn submit(&self, request: &ReportMetricsRequest) {
+        match tokio::time::timeout(DELIVERY_TIMEOUT, self.deliver(request)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "REST metrics delivery failed"),
             Err(_) => tracing::warn!("REST metrics delivery timed out"),
         }
     }
 
-    async fn deliver(&self, endpoint: &str, report: &ReportMetricsRequest) -> iceberg::Result<()> {
+    async fn deliver(&self, report: &ReportMetricsRequest) -> iceberg::Result<()> {
         let request = HttpRequest::build(
             self.http_client
-                .request(Method::POST, endpoint)
+                .request(Method::POST, &self.endpoint)
                 .json(report),
         )?;
         let response = self
@@ -94,32 +121,15 @@ impl RestMetricsReporter {
     }
 }
 
-fn redact_predicate(predicate: &Predicate) -> Predicate {
-    use iceberg::expr::{BinaryExpression, SetExpression};
-    match predicate {
-        Predicate::AlwaysTrue | Predicate::AlwaysFalse | Predicate::Unary(_) => predicate.clone(),
-        Predicate::And(expr) => {
-            let [a, b] = expr.inputs();
-            redact_predicate(a).and(redact_predicate(b))
-        }
-        Predicate::Or(expr) => {
-            let [a, b] = expr.inputs();
-            redact_predicate(a).or(redact_predicate(b))
-        }
-        Predicate::Not(expr) => !redact_predicate(expr.inputs()[0]),
-        Predicate::Binary(expr) => Predicate::Binary(BinaryExpression::new(
-            expr.op(),
-            expr.term().clone(),
-            Datum::string("(redacted)"),
-        )),
-        Predicate::Set(expr) => Predicate::Set(SetExpression::new(
-            expr.op(),
-            expr.term().clone(),
-            expr.literals()
-                .iter()
-                .map(|_| Datum::string("(redacted)"))
-                .collect(),
-        )),
+#[derive(Debug)]
+enum ReportFilter {
+    Raw(Predicate),
+    Sanitized(Value),
+}
+
+impl From<Predicate> for ReportFilter {
+    fn from(predicate: Predicate) -> Self {
+        Self::Raw(predicate)
     }
 }
 
@@ -136,7 +146,7 @@ pub(crate) struct ReportMetricsRequest {
     snapshot_id: i64,
     schema_id: SchemaId,
     #[serde(serialize_with = "filter")]
-    filter: Option<Predicate>,
+    filter: Option<ReportFilter>,
     projected_field_names: Vec<String>,
     projected_field_ids: Vec<i32>,
     metrics: ScanMetricsResult,
@@ -151,7 +161,7 @@ impl From<&ScanReport> for ReportMetricsRequest {
             table_name: report.table_ident().to_string(),
             snapshot_id: report.snapshot_id(),
             schema_id: report.schema_id(),
-            filter: report.filter().cloned(),
+            filter: report.filter().cloned().map(ReportFilter::Raw),
             projected_field_names: report.projected_field_names().to_vec(),
             projected_field_ids: report.projected_field_ids().to_vec(),
             metrics: report.metrics().into(),
@@ -223,8 +233,12 @@ impl From<&ScanMetrics> for ScanMetricsResult {
     }
 }
 
-fn filter<S: Serializer>(filter: &Option<Predicate>, serializer: S) -> Result<S::Ok, S::Error> {
-    RestPredicate(filter.as_ref().unwrap_or(&Predicate::AlwaysTrue)).serialize(serializer)
+fn filter<S: Serializer>(filter: &Option<ReportFilter>, serializer: S) -> Result<S::Ok, S::Error> {
+    match filter {
+        Some(ReportFilter::Raw(predicate)) => RestPredicate(predicate).serialize(serializer),
+        Some(ReportFilter::Sanitized(value)) => value.serialize(serializer),
+        None => serializer.serialize_bool(true),
+    }
 }
 
 fn count<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
@@ -435,18 +449,18 @@ mod tests {
     #[test]
     fn test_redacted_filter() {
         let predicate = Reference::new("secret")
-            .equal_to(Datum::string("private"))
+            .equal_to(Datum::string("aaa"))
             .and(!Reference::new("ids").is_in([Datum::int(10), Datum::int(20)]))
             .or(Reference::new("value").is_null());
         let expected = json!({"type":"or", "left":{"type":"and",
-            "left":{"type":"eq","term":"secret","value":"(redacted)"},
-            "right":{"type":"not","child":{"type":"in","term":"ids","values":["(redacted)"]}}},
+            "left":{"type":"eq","term":"secret","value":"(hash-34d05fb7)"},
+            "right":{"type":"not","child":{"type":"in","term":"ids","values":["(2-digit-int)","(2-digit-int)"]}}},
             "right":{"type":"is-null","term":"value"}});
         assert_eq!(
-            serde_json::to_value(RestPredicate(&redact_predicate(&predicate))).unwrap(),
+            redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
             expected
         );
-        assert!(format!("{predicate}").contains("private"));
+        assert!(format!("{predicate}").contains("aaa"));
     }
 
     async fn reporter(
@@ -454,11 +468,12 @@ mod tests {
         contextual_session: Arc<dyn AuthSession>,
     ) -> RestMetricsReporter {
         let config = RestCatalogConfig::builder().uri(uri).build();
-        RestMetricsReporter {
-            http_client: HttpClient::new(&config).unwrap(),
+        RestMetricsReporter::new(
+            &TableIdent::from_strs(["analytics", "sales", "orders"]).unwrap(),
+            &config,
+            HttpClient::new(&config).unwrap(),
             contextual_session,
-            config,
-        }
+        )
     }
 
     #[tokio::test]
@@ -466,7 +481,10 @@ mod tests {
         for status in [204, 400, 401, 403, 404, 405, 429, 500, 501, 503] {
             let mut server = mockito::Server::new_async().await;
             let request = server
-                .mock("POST", "/metrics")
+                .mock(
+                    "POST",
+                    "/v1/namespaces/analytics%1Fsales/tables/orders/metrics",
+                )
                 .with_status(status)
                 .with_body("not JSON")
                 .expect(1)
@@ -474,10 +492,7 @@ mod tests {
                 .await;
             let reporter = reporter(server.url(), Arc::new(crate::auth::NoopSession)).await;
             assert_eq!(
-                reporter
-                    .deliver(&format!("{}/metrics", server.url()), &scan_report())
-                    .await
-                    .is_ok(),
+                reporter.deliver(&scan_report()).await.is_ok(),
                 status == 204
             );
             request.assert_async().await;
@@ -503,7 +518,7 @@ mod tests {
         .await;
         tokio::time::timeout(
             DELIVERY_TIMEOUT + Duration::from_secs(2),
-            reporter.submit("http://127.0.0.1:1/metrics", &scan_report()),
+            reporter.submit(&scan_report()),
         )
         .await
         .unwrap();
@@ -523,7 +538,7 @@ mod tests {
         report.projected_field_ids.clear();
         report.projected_field_names.clear();
         report.metadata.clear();
-        report.filter = Some(Predicate::AlwaysFalse);
+        report.filter = Some(Predicate::AlwaysFalse.into());
         let mut expected: Value =
             serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
         expected.as_object_mut().unwrap().remove("metadata");
@@ -537,11 +552,14 @@ mod tests {
     fn test_scan_report_nested_filter() {
         let mut report = scan_report();
         report.filter = Some(
-            Reference::new("a").is_null().and(
-                Reference::new("b")
-                    .equal_to(Datum::int(10))
-                    .or(!Reference::new("c").is_nan()),
-            ),
+            Reference::new("a")
+                .is_null()
+                .and(
+                    Reference::new("b")
+                        .equal_to(Datum::int(10))
+                        .or(!Reference::new("c").is_nan()),
+                )
+                .into(),
         );
         let mut expected: Value =
             serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
@@ -647,7 +665,7 @@ mod tests {
                 Reference::new("value").is_in([datum.clone()]),
             ] {
                 let mut report = scan_report();
-                report.filter = Some(predicate);
+                report.filter = Some(predicate.into());
                 assert!(serde_json::to_value(report).is_err());
             }
         }
@@ -787,11 +805,15 @@ mod tests {
             Datum::double(f64::NEG_INFINITY),
         ] {
             let mut report = scan_report();
-            report.filter = Some(Reference::new("value").equal_to(datum));
+            report.filter = Some(Reference::new("value").equal_to(datum).into());
             assert!(serde_json::to_value(report).is_err());
         }
         let mut report = scan_report();
-        report.filter = Some(Reference::new("value").is_in([Datum::double(f64::NAN)]));
+        report.filter = Some(
+            Reference::new("value")
+                .is_in([Datum::double(f64::NAN)])
+                .into(),
+        );
         assert!(serde_json::to_value(report).is_err());
     }
 }

@@ -14,7 +14,7 @@
   "filter": {
     "type": "gt",
     "term": "id",
-    "value": "(redacted)"
+    "value": "(5-digit-int)"
   },
   "metrics": {
     "total-data-manifests": {

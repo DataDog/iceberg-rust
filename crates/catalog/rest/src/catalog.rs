@@ -682,16 +682,18 @@ fn metrics_reporting_enabled(config: &RestCatalogConfig, endpoints: &HashSet<End
 }
 
 fn configure_table_reporting(
+    table_ident: &TableIdent,
     contextual_session: Arc<dyn AuthSession>,
     client: &RestCatalogClient,
     builder: TableBuilder,
 ) -> TableBuilder {
     if client.metrics_reporting_enabled {
-        builder.metrics_reporter(Arc::new(RestMetricsReporter {
-            http_client: client.http_client.clone(),
+        builder.metrics_reporter(Arc::new(RestMetricsReporter::new(
+            table_ident,
+            &client.config,
+            client.http_client.clone(),
             contextual_session,
-            config: client.config.clone(),
-        }))
+        )))
     } else {
         builder
     }
@@ -1402,7 +1404,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata(response.metadata)
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(contextual_session, client, table_builder);
+            configure_table_reporting(&table_ident, contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -1505,7 +1507,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata(response.metadata)
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(contextual_session, client, table_builder);
+            configure_table_reporting(table_ident, contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -1664,7 +1666,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata_location(metadata_location.clone())
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(contextual_session, client, table_builder);
+            configure_table_reporting(table_ident, contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -1749,8 +1751,12 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata(response.metadata)
             .metadata_location(response.metadata_location)
             .runtime(self.runtime.clone());
-        let mut table_builder =
-            configure_table_reporting(contextual_session, client, table_builder);
+        let mut table_builder = configure_table_reporting(
+            commit.identifier(),
+            contextual_session,
+            client,
+            table_builder,
+        );
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -5946,6 +5952,72 @@ mod tests {
         async fn report(&self, _: &iceberg::metrics::MetricsReport) {
             self.0.send(()).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_rest_metrics_reject_reports_for_another_table() {
+        use futures::TryStreamExt;
+        use iceberg::metrics::{MetricsReport, MetricsReporter};
+
+        #[derive(Debug)]
+        struct CheckedReporter(RestMetricsReporter, tokio::sync::mpsc::Sender<()>);
+
+        #[async_trait]
+        impl MetricsReporter for CheckedReporter {
+            async fn report(&self, report: &MetricsReport) {
+                self.0.report(report).await;
+                self.1.send(()).await.unwrap();
+            }
+        }
+
+        let (_dir, body) = reporting_table_body().await;
+        let mut server = Server::new_async().await;
+        let _config = create_config_mock(&mut server).await;
+        let _load = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let requests = server
+            .mock(
+                "POST",
+                Matcher::Regex("/v1/namespaces/.*/metrics".to_owned()),
+            )
+            .with_status(204)
+            .expect(0)
+            .create_async()
+            .await;
+        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+        let context = SessionContext::empty();
+        let table = catalog
+            .load_table(&context, &test_table_ident())
+            .await
+            .unwrap();
+        let client = catalog.client().await.unwrap();
+        let reporter = RestMetricsReporter::new(
+            &TableIdent::from_strs(["ns1", "other"]).unwrap(),
+            &client.config,
+            client.http_client.clone(),
+            client.contextual_session(&context).await.unwrap(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        table
+            .scan()
+            .with_metrics_reporter(Arc::new(CheckedReporter(reporter, sender)))
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        requests.assert_async().await;
     }
 
     #[tokio::test]

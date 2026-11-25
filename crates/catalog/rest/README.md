@@ -33,13 +33,13 @@ supports the report-metrics endpoint. Reports are delivered asynchronously after
 scan planning finishes successfully. Delivery failures do not fail the scan.
 Each table retains a reporter with the contextual authentication session used for
 its catalog operation. Reporters share the catalog's HTTP transport and derive
-the metrics endpoint from each report's table identifier. Authentication sessions
+the metrics endpoint when constructed for the table. Authentication sessions
 are responsible for refreshing their credentials; delivery does not derive a new
 session from a scan context.
 
-Filter literals are replaced with `(redacted)` before delivery. This uniform
-redaction does not implement Java's numeric magnitude, relative date/time, and
-string-hash representations.
+Filter literals are sanitized before delivery using numeric magnitudes, relative
+dates and timestamps, and stable string hashes. Binary and fixed literals use
+their Rust text representation as hash input.
 
 Set the catalog property `rest-metrics-reporting-enabled` to `false` to disable
 REST reporting (the default is `true`). A table or scan can override the inherited
