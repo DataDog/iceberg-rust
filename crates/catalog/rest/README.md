@@ -31,9 +31,11 @@ See the [API documentation](https://docs.rs/iceberg-catalog-rest/latest) for exa
 Tables returned by the REST catalog inherit a metrics reporter when the server
 supports the report-metrics endpoint. Reports are delivered asynchronously after
 scan planning finishes successfully. Delivery failures do not fail the scan.
-Reports retain the authentication session used for the table operation; delivery
-does not derive a new session from a scan context. Each table keeps its own reporter
-and metrics endpoint while sharing the catalog's HTTP transport.
+Each table retains a reporter with the contextual authentication session used for
+its catalog operation. Reporters share the catalog's HTTP transport and derive
+the metrics endpoint from each report's table identifier. Authentication sessions
+are responsible for refreshing their credentials; delivery does not derive a new
+session from a scan context.
 
 Filter literals are replaced with `(redacted)` before delivery. This uniform
 redaction does not implement Java's numeric magnitude, relative date/time, and

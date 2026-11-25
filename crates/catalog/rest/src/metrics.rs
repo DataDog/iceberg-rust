@@ -28,6 +28,7 @@ use serde::ser::{Error, SerializeStruct};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
+use crate::RestCatalogConfig;
 use crate::auth::AuthSession;
 use crate::client::HttpClient;
 use crate::request::HttpRequest;
@@ -36,8 +37,8 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct RestMetricsReporter {
     pub(crate) http_client: HttpClient,
-    pub(crate) catalog_session: Arc<dyn AuthSession>,
-    pub(crate) endpoint: String,
+    pub(crate) contextual_session: Arc<dyn AuthSession>,
+    pub(crate) config: RestCatalogConfig,
 }
 
 impl Debug for RestMetricsReporter {
@@ -53,30 +54,34 @@ impl MetricsReporter for RestMetricsReporter {
         let MetricsReport::Scan(report) = report else {
             return;
         };
+        let endpoint = format!(
+            "{}/metrics",
+            self.config.table_endpoint(report.table_ident())
+        );
         let mut request = ReportMetricsRequest::from(report);
         request.filter = request.filter.as_ref().map(redact_predicate);
-        self.submit(&request).await;
+        self.submit(&endpoint, &request).await;
     }
 }
 
 impl RestMetricsReporter {
-    async fn submit(&self, request: &ReportMetricsRequest) {
-        match tokio::time::timeout(DELIVERY_TIMEOUT, self.deliver(request)).await {
+    async fn submit(&self, endpoint: &str, request: &ReportMetricsRequest) {
+        match tokio::time::timeout(DELIVERY_TIMEOUT, self.deliver(endpoint, request)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "REST metrics delivery failed"),
             Err(_) => tracing::warn!("REST metrics delivery timed out"),
         }
     }
 
-    async fn deliver(&self, report: &ReportMetricsRequest) -> iceberg::Result<()> {
+    async fn deliver(&self, endpoint: &str, report: &ReportMetricsRequest) -> iceberg::Result<()> {
         let request = HttpRequest::build(
             self.http_client
-                .request(Method::POST, &self.endpoint)
+                .request(Method::POST, endpoint)
                 .json(report),
         )?;
         let response = self
             .http_client
-            .query_catalog(self.catalog_session.as_ref(), request)
+            .query_catalog(self.contextual_session.as_ref(), request)
             .await?;
         if response.status() != StatusCode::NO_CONTENT {
             return Err(iceberg::Error::new(
@@ -444,16 +449,15 @@ mod tests {
         assert!(format!("{predicate}").contains("private"));
     }
 
-    async fn reporter(endpoint: String, session: Arc<dyn AuthSession>) -> RestMetricsReporter {
+    async fn reporter(
+        uri: String,
+        contextual_session: Arc<dyn AuthSession>,
+    ) -> RestMetricsReporter {
+        let config = RestCatalogConfig::builder().uri(uri).build();
         RestMetricsReporter {
-            http_client: HttpClient::new(
-                &crate::catalog::RestCatalogConfig::builder()
-                    .uri(endpoint.clone())
-                    .build(),
-            )
-            .unwrap(),
-            catalog_session: session,
-            endpoint,
+            http_client: HttpClient::new(&config).unwrap(),
+            contextual_session,
+            config,
         }
     }
 
@@ -468,13 +472,12 @@ mod tests {
                 .expect(1)
                 .create_async()
                 .await;
-            let reporter = reporter(
-                format!("{}/metrics", server.url()),
-                Arc::new(crate::auth::NoopSession),
-            )
-            .await;
+            let reporter = reporter(server.url(), Arc::new(crate::auth::NoopSession)).await;
             assert_eq!(
-                reporter.deliver(&scan_report()).await.is_ok(),
+                reporter
+                    .deliver(&format!("{}/metrics", server.url()), &scan_report())
+                    .await
+                    .is_ok(),
                 status == 204
             );
             request.assert_async().await;
@@ -500,7 +503,7 @@ mod tests {
         .await;
         tokio::time::timeout(
             DELIVERY_TIMEOUT + Duration::from_secs(2),
-            reporter.submit(&scan_report()),
+            reporter.submit("http://127.0.0.1:1/metrics", &scan_report()),
         )
         .await
         .unwrap();

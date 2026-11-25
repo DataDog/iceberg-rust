@@ -308,7 +308,7 @@ impl RestCatalogConfig {
         self.url_prefixed(&["namespaces", &ns.to_url_string(), "register"])
     }
 
-    fn table_endpoint(&self, table: &TableIdent) -> String {
+    pub(crate) fn table_endpoint(&self, table: &TableIdent) -> String {
         self.url_prefixed(&[
             "namespaces",
             &table.namespace.to_url_string(),
@@ -608,18 +608,21 @@ impl RestCatalogClient {
         self.http_client.token(self.catalog_session.as_ref()).await
     }
 
-    /// Sends `request` with the authentication derived for `context`.
+    /// Derives the authentication session for one catalog operation.
+    async fn contextual_session(&self, context: &SessionContext) -> Result<Arc<dyn AuthSession>> {
+        self.auth_manager
+            .contextual_session(context, Arc::clone(&self.catalog_session))
+            .await
+    }
+
+    /// Sends `request` with `contextual_session`.
     async fn query_catalog(
         &self,
-        context: &SessionContext,
+        contextual_session: &dyn AuthSession,
         request: HttpRequest,
     ) -> Result<HttpResponse> {
-        let session = self
-            .auth_manager
-            .contextual_session(context, Arc::clone(&self.catalog_session))
-            .await?;
         self.http_client
-            .query_catalog(session.as_ref(), request)
+            .query_catalog(contextual_session, request)
             .await
     }
 
@@ -679,16 +682,15 @@ fn metrics_reporting_enabled(config: &RestCatalogConfig, endpoints: &HashSet<End
 }
 
 fn configure_table_reporting(
-    auth_session: Arc<dyn AuthSession>,
+    contextual_session: Arc<dyn AuthSession>,
     client: &RestCatalogClient,
-    ident: &TableIdent,
     builder: TableBuilder,
 ) -> TableBuilder {
     if client.metrics_reporting_enabled {
         builder.metrics_reporter(Arc::new(RestMetricsReporter {
             http_client: client.http_client.clone(),
-            catalog_session: auth_session,
-            endpoint: format!("{}/metrics", client.config.table_endpoint(ident)),
+            contextual_session,
+            config: client.config.clone(),
         }))
     } else {
         builder
@@ -907,7 +909,10 @@ impl RestSessionCatalog {
 
         let request = HttpRequest::build(request_builder)?;
         client.invalidate_table(context, table);
-        let http_response = client.query_catalog(context, request).await?;
+        let contextual_session = client.contextual_session(context).await?;
+        let http_response = client
+            .query_catalog(contextual_session.as_ref(), request)
+            .await?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
@@ -1000,7 +1005,10 @@ impl RestSessionCatalog {
         url: String,
     ) -> Result<bool> {
         let request = HttpRequest::build(client.http_client.request(Method::HEAD, url))?;
-        let http_response = client.query_catalog(context, request).await?;
+        let contextual_session = client.contextual_session(context).await?;
+        let http_response = client
+            .query_catalog(contextual_session.as_ref(), request)
+            .await?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(true),
@@ -1068,6 +1076,7 @@ impl SessionCatalog for RestSessionCatalog {
         let mut namespaces = Vec::new();
         // An empty initial token explicitly opts in to pagination.
         let mut next_token = client.page_size.map(|_| String::new());
+        let contextual_session = client.contextual_session(context).await?;
 
         loop {
             let mut request = client.http_client.request(Method::GET, endpoint.clone());
@@ -1086,7 +1095,7 @@ impl SessionCatalog for RestSessionCatalog {
             }
 
             let http_response = client
-                .query_catalog(context, HttpRequest::build(request)?)
+                .query_catalog(contextual_session.as_ref(), HttpRequest::build(request)?)
                 .await?;
 
             match http_response.status() {
@@ -1137,7 +1146,10 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(context, request).await?;
+        let contextual_session = client.contextual_session(context).await?;
+        let http_response = client
+            .query_catalog(contextual_session.as_ref(), request)
+            .await?;
 
         match http_response.status() {
             StatusCode::OK => {
@@ -1168,7 +1180,10 @@ impl SessionCatalog for RestSessionCatalog {
                 .request(Method::GET, client.config.namespace_endpoint(namespace)),
         )?;
 
-        let http_response = client.query_catalog(context, request).await?;
+        let contextual_session = client.contextual_session(context).await?;
+        let http_response = client
+            .query_catalog(contextual_session.as_ref(), request)
+            .await?;
 
         match http_response.status() {
             StatusCode::OK => {
@@ -1233,7 +1248,10 @@ impl SessionCatalog for RestSessionCatalog {
                 .request(Method::DELETE, client.config.namespace_endpoint(namespace)),
         )?;
 
-        let http_response = client.query_catalog(context, request).await?;
+        let contextual_session = client.contextual_session(context).await?;
+        let http_response = client
+            .query_catalog(contextual_session.as_ref(), request)
+            .await?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
@@ -1258,6 +1276,7 @@ impl SessionCatalog for RestSessionCatalog {
         let mut identifiers = Vec::new();
         // An empty initial token explicitly opts in to pagination.
         let mut next_token = client.page_size.map(|_| String::new());
+        let contextual_session = client.contextual_session(context).await?;
 
         loop {
             let mut request = client.http_client.request(Method::GET, endpoint.clone());
@@ -1271,7 +1290,7 @@ impl SessionCatalog for RestSessionCatalog {
             }
 
             let http_response = client
-                .query_catalog(context, HttpRequest::build(request)?)
+                .query_catalog(contextual_session.as_ref(), HttpRequest::build(request)?)
                 .await?;
 
             match http_response.status() {
@@ -1335,13 +1354,9 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let auth_session = client
-            .auth_manager
-            .contextual_session(context, client.catalog_session.clone())
-            .await?;
+        let contextual_session = client.contextual_session(context).await?;
         let http_response = client
-            .http_client
-            .query_catalog(auth_session.as_ref(), request)
+            .query_catalog(contextual_session.as_ref(), request)
             .await?;
 
         let response = match http_response.status() {
@@ -1387,7 +1402,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata(response.metadata)
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(auth_session, client, &table_ident, table_builder);
+            configure_table_reporting(contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -1425,13 +1440,9 @@ impl SessionCatalog for RestSessionCatalog {
         }
         let request = HttpRequest::build(request_builder)?;
 
-        let auth_session = client
-            .auth_manager
-            .contextual_session(context, client.catalog_session.clone())
-            .await?;
+        let contextual_session = client.contextual_session(context).await?;
         let http_response = client
-            .http_client
-            .query_catalog(auth_session.as_ref(), request)
+            .query_catalog(contextual_session.as_ref(), request)
             .await?;
 
         let (response, etag) = match http_response.status() {
@@ -1494,7 +1505,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata(response.metadata)
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(auth_session, client, table_ident, table_builder);
+            configure_table_reporting(contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -1565,7 +1576,10 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, src);
-        let http_response = client.query_catalog(context, request).await?;
+        let contextual_session = client.contextual_session(context).await?;
+        let http_response = client
+            .query_catalog(contextual_session.as_ref(), request)
+            .await?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
@@ -1609,13 +1623,9 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, table_ident);
-        let auth_session = client
-            .auth_manager
-            .contextual_session(context, client.catalog_session.clone())
-            .await?;
+        let contextual_session = client.contextual_session(context).await?;
         let http_response = client
-            .http_client
-            .query_catalog(auth_session.as_ref(), request)
+            .query_catalog(contextual_session.as_ref(), request)
             .await?;
 
         let response: LoadTableResult = match http_response.status() {
@@ -1654,7 +1664,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata_location(metadata_location.clone())
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(auth_session, client, table_ident, table_builder);
+            configure_table_reporting(contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -1683,13 +1693,9 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, commit.identifier());
-        let auth_session = client
-            .auth_manager
-            .contextual_session(context, client.catalog_session.clone())
-            .await?;
+        let contextual_session = client.contextual_session(context).await?;
         let http_response = client
-            .http_client
-            .query_catalog(auth_session.as_ref(), request)
+            .query_catalog(contextual_session.as_ref(), request)
             .await?;
 
         let response: CommitTableResponse = match http_response.status() {
@@ -1744,7 +1750,7 @@ impl SessionCatalog for RestSessionCatalog {
             .metadata_location(response.metadata_location)
             .runtime(self.runtime.clone());
         let mut table_builder =
-            configure_table_reporting(auth_session, client, commit.identifier(), table_builder);
+            configure_table_reporting(contextual_session, client, table_builder);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -3430,7 +3436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_contextual_session_authenticates_each_catalog_request() {
+    async fn test_contextual_session_reused_across_namespace_pages() {
         let mut server = Server::new_async().await;
         let config_mock = create_config_mock(&mut server).await;
         let first_page = server
@@ -3460,10 +3466,7 @@ mod tests {
             NamespaceIdent::new("ns1".to_string()),
             NamespaceIdent::new("ns2".to_string()),
         ]);
-        assert_eq!(*seen_session_ids.lock().unwrap(), vec![
-            "session-123",
-            "session-123"
-        ]);
+        assert_eq!(*seen_session_ids.lock().unwrap(), vec!["session-123"]);
         config_mock.assert_async().await;
         first_page.assert_async().await;
         second_page.assert_async().await;
@@ -4113,6 +4116,7 @@ mod tests {
 
         let list_tables_mock_page1 = server
             .mock("GET", "/v1/namespaces/ns1/tables")
+            .match_header("x-session-id", "tables-session")
             .with_status(200)
             .with_body(
                 r#"{
@@ -4134,6 +4138,7 @@ mod tests {
 
         let list_tables_mock_page2 = server
             .mock("GET", "/v1/namespaces/ns1/tables?pageToken=token456")
+            .match_header("x-session-id", "tables-session")
             .with_status(200)
             .with_body(
                 r#"{
@@ -4152,13 +4157,16 @@ mod tests {
             .create_async()
             .await;
 
-        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+        let (catalog, seen_session_ids) = context_catalog(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            false,
+        );
+        let context = SessionContext::builder()
+            .session_id("tables-session".to_owned())
+            .build();
 
         let tables = catalog
-            .list_tables(
-                &SessionContext::empty(),
-                &NamespaceIdent::new("ns1".to_string()),
-            )
+            .list_tables(&context, &NamespaceIdent::new("ns1".to_string()))
             .await
             .unwrap();
 
@@ -4170,6 +4178,7 @@ mod tests {
         ];
 
         assert_eq!(tables, expected_tables);
+        assert_eq!(*seen_session_ids.lock().unwrap(), vec!["tables-session"]);
 
         config_mock.assert_async().await;
         list_tables_mock_page1.assert_async().await;
@@ -5765,6 +5774,21 @@ mod tests {
             .await;
         let (reports, mut received) =
             report_request_mock(&mut server, &format!("{path}/metrics"), Matcher::Any, 7).await;
+        let second_path = "/v1/namespaces/ns2/tables/test2";
+        let second_load = server
+            .mock("GET", second_path)
+            .match_header("x-session-id", "bob")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let (second_reports, mut second_received) = report_request_mock(
+            &mut server,
+            &format!("{second_path}/metrics"),
+            "bob".into(),
+            1,
+        )
+        .await;
         let (mut catalog, seen) = context_catalog(
             RestCatalogConfig::builder().uri(server.url()).build(),
             false,
@@ -5780,6 +5804,8 @@ mod tests {
         let first = catalog.load_table(&context, &ident).await.unwrap();
         let cached_table = catalog.load_table(&context, &ident).await.unwrap();
         let other_table = catalog.load_table(&other, &ident).await.unwrap();
+        let second_ident = TableIdent::from_strs(["ns2", "test2"]).unwrap();
+        let second_table = catalog.load_table(&other, &second_ident).await.unwrap();
         let created = catalog
             .create_table(
                 &context,
@@ -5816,6 +5842,7 @@ mod tests {
             (first, "alice"),
             (cached_table, "alice"),
             (other_table, "bob"),
+            (second_table, "bob"),
             (created, "alice"),
             (registered, "alice"),
             (updated, "bob"),
@@ -5835,7 +5862,12 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-            let (report, headers) = receive_report(&mut received).await;
+            let receiver = if table.identifier() == &second_ident {
+                &mut second_received
+            } else {
+                &mut received
+            };
+            let (report, headers) = receive_report(receiver).await;
             let duration = report["metrics"]["total-planning-duration"]["total-duration"]
                 .as_i64()
                 .unwrap();
@@ -5843,6 +5875,7 @@ mod tests {
             let mut expected: serde_json::Value =
                 serde_json::from_str(include_str!("../testdata/metrics/completed-scan.json"))
                     .unwrap();
+            expected["table-name"] = json!(table.identifier().to_string());
             expected["snapshot-id"] = json!(table.metadata().current_snapshot_id().unwrap());
             expected["metrics"]["total-planning-duration"]["total-duration"] = json!(duration);
             expected["metadata"]["iceberg-version"] =
@@ -5852,7 +5885,10 @@ mod tests {
         }
         assert_eq!(*seen.lock().unwrap(), sessions_before_reporting);
         assert!(received.try_recv().is_err());
+        assert!(second_received.try_recv().is_err());
         reports.assert_async().await;
+        second_reports.assert_async().await;
+        second_load.assert_async().await;
         cached.assert_async().await;
         create.assert_async().await;
         register.assert_async().await;
