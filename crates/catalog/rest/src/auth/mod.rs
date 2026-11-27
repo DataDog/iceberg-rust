@@ -89,14 +89,18 @@ pub trait AuthManager: Debug + Send + Sync {
     /// manager. If the context does not require different authentication,
     /// implementations should return `catalog_session` unchanged.
     ///
-    /// The catalog does not cache the returned session. Implementations should
-    /// cache context-specific sessions internally using [`SessionContext::session_id`]
-    /// and are responsible for eviction. Reusing a session ID with different
-    /// context may therefore return the previously cached session.
+    /// The catalog derives one session per operation and reuses it for that
+    /// operation's requests. Returned tables may retain the session for metrics
+    /// reporting.
     ///
-    /// The catalog calls this method for every request without serializing
-    /// calls that share a session ID. Caching implementations must guard
-    /// against concurrently creating multiple sessions for the same context.
+    /// Implementations may cache context-specific sessions internally using
+    /// [`SessionContext::session_id`] and are responsible for eviction. Reusing
+    /// a session ID with different context may therefore return the previously
+    /// cached session.
+    ///
+    /// The catalog calls this method without serializing calls that share a
+    /// session ID. Caching implementations must guard against concurrently
+    /// creating multiple sessions for the same context.
     ///
     /// No [`HttpClient`] is passed. Implementations that need one, e.g. for a
     /// token exchange, should store the client handed to [`Self::catalog_session`].
@@ -111,6 +115,9 @@ pub trait AuthManager: Debug + Send + Sync {
 }
 
 /// Authenticates outgoing REST catalog requests.
+///
+/// Sessions may be retained and shared across operations. Implementations are responsible
+/// for refreshing expiring credentials and applying current authentication to each request.
 #[async_trait]
 pub trait AuthSession: Debug + Send + Sync {
     /// Applies authentication to the request (adds headers, signs, ...).

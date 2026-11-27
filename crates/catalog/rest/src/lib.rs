@@ -99,6 +99,7 @@ pub use request::{HttpRequest, HttpRequestBody};
 mod response;
 pub use response::HttpResponse;
 mod endpoint;
+mod metrics;
 mod types;
 
 pub use auth::*;

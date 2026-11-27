@@ -1,0 +1,555 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+use std::time::Duration;
+
+use iceberg::TableIdent;
+use iceberg::expr::PredicateOperator;
+use iceberg::metrics::{MetricsReport, MetricsReporter, ScanMetrics, ScanReport};
+use iceberg::spec::SchemaId;
+use reqwest::{Method, StatusCode};
+use serde::ser::Error;
+use serde::{Serialize, Serializer};
+use serde_json::Value;
+
+use crate::RestCatalogConfig;
+use crate::auth::AuthSession;
+use crate::client::HttpClient;
+use crate::request::HttpRequest;
+
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+mod sanitize;
+use sanitize::redact_predicate;
+
+pub(crate) struct RestMetricsReporter {
+    table_ident: TableIdent,
+    http_client: HttpClient,
+    contextual_session: Arc<dyn AuthSession>,
+    endpoint: String,
+}
+
+impl Debug for RestMetricsReporter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestMetricsReporter")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl MetricsReporter for RestMetricsReporter {
+    async fn report(&self, report: &MetricsReport) {
+        let MetricsReport::Scan(report) = report else {
+            return;
+        };
+        if report.table_ident() != &self.table_ident {
+            tracing::warn!("Ignoring REST metrics report for a different table");
+            return;
+        }
+        let request = match ReportMetricsRequest::try_from(report) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "REST metrics report construction failed");
+                return;
+            }
+        };
+        self.submit(&request).await;
+    }
+}
+
+impl RestMetricsReporter {
+    pub(crate) fn new(
+        table_ident: &TableIdent,
+        config: &RestCatalogConfig,
+        http_client: HttpClient,
+        contextual_session: Arc<dyn AuthSession>,
+    ) -> Self {
+        Self {
+            table_ident: table_ident.clone(),
+            http_client,
+            contextual_session,
+            endpoint: format!("{}/metrics", config.table_endpoint(table_ident)),
+        }
+    }
+
+    async fn submit(&self, request: &ReportMetricsRequest) {
+        match tokio::time::timeout(DELIVERY_TIMEOUT, self.deliver(request)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(kind = ?error.kind(), "REST metrics delivery failed"),
+            Err(_) => tracing::warn!("REST metrics delivery timed out"),
+        }
+    }
+
+    async fn deliver(&self, report: &ReportMetricsRequest) -> iceberg::Result<()> {
+        let request = HttpRequest::build(
+            self.http_client
+                .request(Method::POST, &self.endpoint)
+                .json(report),
+        )?;
+        let response = self
+            .http_client
+            .query_catalog(self.contextual_session.as_ref(), request)
+            .await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "REST metrics request failed",
+            )
+            .with_context("status", response.status().to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// A metrics report request for the Iceberg REST catalog.
+///
+/// Filter literals are sanitized during construction. Metrics outside the signed 64-bit
+/// range (nanoseconds for planning duration) return serialization errors.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct ReportMetricsRequest {
+    report_type: &'static str,
+    table_name: String,
+    snapshot_id: i64,
+    schema_id: SchemaId,
+    filter: Value,
+    projected_field_names: Vec<String>,
+    projected_field_ids: Vec<i32>,
+    metrics: ScanMetricsResult,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    metadata: HashMap<String, String>,
+}
+
+impl TryFrom<&ScanReport> for ReportMetricsRequest {
+    type Error = iceberg::Error;
+
+    fn try_from(report: &ScanReport) -> iceberg::Result<Self> {
+        let now = chrono::Utc::now();
+        let filter = report
+            .filter()
+            .map(|predicate| redact_predicate(predicate, now))
+            .transpose()?
+            .unwrap_or(Value::Bool(true));
+        Ok(Self {
+            report_type: "scan-report",
+            table_name: report.table_ident().to_string(),
+            snapshot_id: report.snapshot_id(),
+            schema_id: report.schema_id(),
+            filter,
+            projected_field_names: report.projected_field_names().to_vec(),
+            projected_field_ids: report.projected_field_ids().to_vec(),
+            metrics: report.metrics().into(),
+            metadata: report.metadata().clone(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ScanMetricsResult {
+    #[serde(serialize_with = "duration")]
+    total_planning_duration: Duration,
+    #[serde(serialize_with = "count")]
+    total_data_manifests: u64,
+    #[serde(serialize_with = "count")]
+    total_delete_manifests: u64,
+    #[serde(serialize_with = "count")]
+    skipped_data_manifests: u64,
+    #[serde(serialize_with = "count")]
+    skipped_delete_manifests: u64,
+    #[serde(serialize_with = "count")]
+    scanned_data_manifests: u64,
+    #[serde(serialize_with = "count")]
+    scanned_delete_manifests: u64,
+    #[serde(serialize_with = "count")]
+    result_data_files: u64,
+    #[serde(serialize_with = "count")]
+    skipped_data_files: u64,
+    #[serde(serialize_with = "bytes")]
+    total_file_size_in_bytes: u64,
+    #[serde(serialize_with = "count")]
+    result_delete_files: u64,
+    #[serde(serialize_with = "count")]
+    skipped_delete_files: u64,
+    #[serde(serialize_with = "bytes")]
+    total_delete_file_size_in_bytes: u64,
+    #[serde(serialize_with = "count")]
+    indexed_delete_files: u64,
+    #[serde(serialize_with = "count")]
+    equality_delete_files: u64,
+    #[serde(serialize_with = "count")]
+    positional_delete_files: u64,
+    #[serde(serialize_with = "count")]
+    dvs: u64,
+}
+
+impl From<&ScanMetrics> for ScanMetricsResult {
+    fn from(metrics: &ScanMetrics) -> Self {
+        Self {
+            total_planning_duration: metrics.total_planning_duration(),
+            total_data_manifests: metrics.total_data_manifests(),
+            total_delete_manifests: metrics.total_delete_manifests(),
+            skipped_data_manifests: metrics.skipped_data_manifests(),
+            skipped_delete_manifests: metrics.skipped_delete_manifests(),
+            scanned_data_manifests: metrics.scanned_data_manifests(),
+            scanned_delete_manifests: metrics.scanned_delete_manifests(),
+            result_data_files: metrics.result_data_files(),
+            skipped_data_files: metrics.skipped_data_files(),
+            total_file_size_in_bytes: metrics.total_file_size_in_bytes(),
+            result_delete_files: metrics.result_delete_files(),
+            skipped_delete_files: metrics.skipped_delete_files(),
+            total_delete_file_size_in_bytes: metrics.total_delete_file_size_in_bytes(),
+            indexed_delete_files: metrics.indexed_delete_files(),
+            equality_delete_files: metrics.equality_delete_files(),
+            positional_delete_files: metrics.positional_delete_files(),
+            dvs: metrics.dvs(),
+        }
+    }
+}
+
+fn count<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    counter("count", *value, serializer)
+}
+
+fn bytes<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    counter("bytes", *value, serializer)
+}
+
+fn counter<S: Serializer>(
+    unit: &'static str,
+    value: u64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    CounterResult {
+        unit,
+        value: i64::try_from(value).map_err(S::Error::custom)?,
+    }
+    .serialize(serializer)
+}
+
+fn duration<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+    TimerResult {
+        time_unit: "nanoseconds",
+        count: 1,
+        total_duration: i64::try_from(value.as_nanos()).map_err(S::Error::custom)?,
+    }
+    .serialize(serializer)
+}
+
+#[derive(Serialize)]
+struct CounterResult {
+    unit: &'static str,
+    value: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct TimerResult {
+    time_unit: &'static str,
+    count: i64,
+    total_duration: i64,
+}
+
+fn operator(op: PredicateOperator) -> iceberg::Result<&'static str> {
+    Ok(match op {
+        PredicateOperator::IsNull => "is-null",
+        PredicateOperator::NotNull => "not-null",
+        PredicateOperator::IsNan => "is-nan",
+        PredicateOperator::NotNan => "not-nan",
+        PredicateOperator::LessThan => "lt",
+        PredicateOperator::LessThanOrEq => "lt-eq",
+        PredicateOperator::GreaterThan => "gt",
+        PredicateOperator::GreaterThanOrEq => "gt-eq",
+        PredicateOperator::Eq => "eq",
+        PredicateOperator::NotEq => "not-eq",
+        PredicateOperator::StartsWith => "starts-with",
+        PredicateOperator::NotStartsWith => "not-starts-with",
+        PredicateOperator::In => "in",
+        PredicateOperator::NotIn => "not-in",
+        _ => {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::FeatureUnsupported,
+                "Unsupported scan-report predicate operator",
+            ));
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use iceberg::expr::{BinaryExpression, Predicate, Reference, SetExpression, UnaryExpression};
+    use iceberg::spec::Datum;
+    use serde_json::json;
+
+    use super::*;
+
+    fn scan_report() -> ReportMetricsRequest {
+        ReportMetricsRequest {
+            report_type: "scan-report",
+            table_name: "analytics.sales.orders".into(),
+            snapshot_id: -12345,
+            schema_id: 7,
+            filter: json!(true),
+            projected_field_ids: vec![1, 2, -1],
+            projected_field_names: vec!["id".into(), "customer.名".into(), "_file".into()],
+            metadata: HashMap::from([("query-id".into(), "query-123".into())]),
+            metrics: ScanMetricsResult {
+                total_planning_duration: Duration::new(2, 644_235_116),
+                total_data_manifests: 1,
+                total_delete_manifests: 2,
+                skipped_data_manifests: 3,
+                skipped_delete_manifests: 4,
+                scanned_data_manifests: 5,
+                scanned_delete_manifests: 6,
+                result_data_files: 7,
+                skipped_data_files: 8,
+                total_file_size_in_bytes: 9,
+                result_delete_files: 10,
+                skipped_delete_files: 11,
+                total_delete_file_size_in_bytes: 12,
+                indexed_delete_files: 13,
+                equality_delete_files: 14,
+                positional_delete_files: 15,
+                dvs: 16,
+            },
+        }
+    }
+
+    #[test]
+    fn test_redacted_filter() {
+        let predicate = Reference::new("secret")
+            .equal_to(Datum::string("aaa"))
+            .and(!Reference::new("ids").is_in([Datum::int(10), Datum::int(20)]))
+            .or(Reference::new("value").is_null());
+        let expected = json!({"type":"or", "left":{"type":"and",
+            "left":{"type":"eq","term":"secret","value":"(hash-34d05fb7)"},
+            "right":{"type":"not","child":{"type":"in","term":"ids","values":["(2-digit-int)","(2-digit-int)"]}}},
+            "right":{"type":"is-null","term":"value"}});
+        assert_eq!(
+            redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+            expected
+        );
+        assert!(format!("{predicate}").contains("aaa"));
+    }
+
+    async fn reporter(
+        uri: String,
+        contextual_session: Arc<dyn AuthSession>,
+    ) -> RestMetricsReporter {
+        let config = RestCatalogConfig::builder().uri(uri).build();
+        RestMetricsReporter::new(
+            &TableIdent::from_strs(["analytics", "sales", "orders"]).unwrap(),
+            &config,
+            HttpClient::new(&config).unwrap(),
+            contextual_session,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_delivery_statuses_and_no_retries() {
+        for status in [204, 400, 401, 403, 404, 405, 429, 500, 501, 503] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock(
+                    "POST",
+                    "/v1/namespaces/analytics%1Fsales/tables/orders/metrics",
+                )
+                .with_status(status)
+                .with_body("not JSON")
+                .expect(1)
+                .create_async()
+                .await;
+            let reporter = reporter(server.url(), Arc::new(crate::auth::NoopSession)).await;
+            assert_eq!(
+                reporter.deliver(&scan_report()).await.is_ok(),
+                status == 204
+            );
+            request.assert_async().await;
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingSession;
+
+    #[async_trait::async_trait]
+    impl AuthSession for PendingSession {
+        async fn authenticate(&self, _: &mut HttpRequest) -> iceberg::Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delivery_timeout_includes_authentication() {
+        let reporter = reporter(
+            "http://127.0.0.1:1/metrics".into(),
+            Arc::new(PendingSession),
+        )
+        .await;
+        tokio::time::timeout(
+            DELIVERY_TIMEOUT + Duration::from_secs(2),
+            reporter.submit(&scan_report()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn test_scan_report_rest_request() {
+        let expected: Value =
+            serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
+        let report = scan_report();
+        assert_eq!(serde_json::to_value(report).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_scan_report_empty_projection_and_metadata() {
+        let mut report = scan_report();
+        report.projected_field_ids.clear();
+        report.projected_field_names.clear();
+        report.metadata.clear();
+        report.filter = json!(false);
+        let mut expected: Value =
+            serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
+        expected.as_object_mut().unwrap().remove("metadata");
+        expected["projected-field-ids"] = json!([]);
+        expected["projected-field-names"] = json!([]);
+        expected["filter"] = json!(false);
+        assert_eq!(serde_json::to_value(report).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_scan_report_nested_filter() {
+        let mut report = scan_report();
+        let predicate = Reference::new("a").is_null().and(
+            Reference::new("b")
+                .equal_to(Datum::int(10))
+                .or(!Reference::new("c").is_nan()),
+        );
+        report.filter = redact_predicate(&predicate, chrono::Utc::now()).unwrap();
+        let mut expected: Value =
+            serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
+        expected["filter"] = json!({
+            "type": "and",
+            "left": {"type": "is-null", "term": "a"},
+            "right": {
+                "type": "or",
+                "left": {"type": "eq", "term": "b", "value": "(2-digit-int)"},
+                "right": {"type": "not", "child": {"type": "is-nan", "term": "c"}}
+            }
+        });
+        assert_eq!(serde_json::to_value(report).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_sanitized_predicate_operators() {
+        for (op, name) in [
+            (PredicateOperator::IsNull, "is-null"),
+            (PredicateOperator::NotNull, "not-null"),
+            (PredicateOperator::IsNan, "is-nan"),
+            (PredicateOperator::NotNan, "not-nan"),
+        ] {
+            let predicate = Predicate::Unary(UnaryExpression::new(op, Reference::new("a.b")));
+            assert_eq!(
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+                json!({"type": name, "term": "a.b"})
+            );
+        }
+        for (op, name) in [
+            (PredicateOperator::LessThan, "lt"),
+            (PredicateOperator::LessThanOrEq, "lt-eq"),
+            (PredicateOperator::GreaterThan, "gt"),
+            (PredicateOperator::GreaterThanOrEq, "gt-eq"),
+            (PredicateOperator::Eq, "eq"),
+            (PredicateOperator::NotEq, "not-eq"),
+            (PredicateOperator::StartsWith, "starts-with"),
+            (PredicateOperator::NotStartsWith, "not-starts-with"),
+        ] {
+            let predicate = Predicate::Binary(BinaryExpression::new(
+                op,
+                Reference::new("a"),
+                Datum::string("aaa"),
+            ));
+            assert_eq!(
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+                json!({"type": name, "term": "a", "value": "(hash-34d05fb7)"})
+            );
+        }
+        for (op, name) in [
+            (PredicateOperator::In, "in"),
+            (PredicateOperator::NotIn, "not-in"),
+        ] {
+            let predicate = Predicate::Set(SetExpression::new(
+                op,
+                Reference::new("a"),
+                [Datum::string("aaa"), Datum::string("test")]
+                    .into_iter()
+                    .collect(),
+            ));
+            assert_eq!(
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+                json!({"type": name, "term": "a", "values": ["(hash-34d05fb7)", "(hash-3a6bd213)"]})
+            );
+        }
+        for (predicate, expected) in [
+            (Predicate::AlwaysTrue, json!(true)),
+            (Predicate::AlwaysFalse, json!(false)),
+        ] {
+            assert_eq!(
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_metrics_int64_boundaries() {
+        let mut report = scan_report();
+        report.metrics.result_data_files = i64::MAX as u64;
+        report.metrics.total_file_size_in_bytes = i64::MAX as u64;
+        report.metrics.total_planning_duration = Duration::from_nanos(i64::MAX as u64);
+        let mut expected: Value =
+            serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
+        expected["metrics"]["result-data-files"]["value"] = json!(i64::MAX);
+        expected["metrics"]["total-file-size-in-bytes"]["value"] = json!(i64::MAX);
+        expected["metrics"]["total-planning-duration"]["total-duration"] = json!(i64::MAX);
+        assert_eq!(serde_json::to_value(report).unwrap(), expected);
+
+        let mut report = scan_report();
+        report.metrics.result_data_files = i64::MAX as u64 + 1;
+        assert!(serde_json::to_value(report).is_err());
+        let mut report = scan_report();
+        report.metrics.total_file_size_in_bytes = u64::MAX;
+        assert!(serde_json::to_value(report).is_err());
+        let mut report = scan_report();
+        report.metrics.total_planning_duration = Duration::from_nanos(i64::MAX as u64 + 1);
+        assert!(serde_json::to_value(report).is_err());
+        let mut report = scan_report();
+        report.metrics.total_planning_duration = Duration::ZERO;
+        report.metrics.result_data_files = 0;
+        let mut expected: Value =
+            serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
+        expected["metrics"]["result-data-files"]["value"] = json!(0);
+        expected["metrics"]["total-planning-duration"]["total-duration"] = json!(0);
+        assert_eq!(serde_json::to_value(report).unwrap(), expected);
+    }
+}

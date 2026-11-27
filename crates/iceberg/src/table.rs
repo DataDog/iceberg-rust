@@ -26,6 +26,7 @@ use crate::error::invalid_data;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
+use crate::metrics::MetricsReporter;
 use crate::runtime::Runtime;
 use crate::scan::TableScanBuilder;
 use crate::spec::{
@@ -44,6 +45,7 @@ pub struct TableBuilder {
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
     runtime: Option<Runtime>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl TableBuilder {
@@ -58,7 +60,14 @@ impl TableBuilder {
             disable_cache: false,
             cache_size_bytes: None,
             runtime: None,
+            metrics_reporter: None,
         }
+    }
+
+    /// Sets the reporter inherited by scans of the built table.
+    pub fn metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
+        self.metrics_reporter = Some(reporter);
+        self
     }
 
     /// required - sets the necessary FileIO to use for the table
@@ -133,6 +142,7 @@ impl TableBuilder {
             disable_cache,
             cache_size_bytes,
             runtime,
+            metrics_reporter,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -189,6 +199,7 @@ impl TableBuilder {
             object_cache,
             runtime,
             encryption_manager,
+            metrics_reporter,
         })
     }
 }
@@ -204,6 +215,7 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl Table {
@@ -226,6 +238,21 @@ impl Table {
     pub fn with_runtime(mut self, runtime: Runtime) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    /// Sets the reporter inherited by scans of this table instance.
+    ///
+    /// Reporting is disabled by default. Configuration is not persisted to the catalog.
+    pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
+        self.metrics_reporter = Some(reporter);
+        self
+    }
+
+    /// Returns the reporter inherited by scans of this table instance.
+    ///
+    /// Pass it to [`TableBuilder::metrics_reporter`] to preserve reporting when rebuilding a table.
+    pub fn metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        self.metrics_reporter.clone()
     }
 
     /// Returns a TableBuilder to build a table
