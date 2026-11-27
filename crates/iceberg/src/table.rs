@@ -248,7 +248,10 @@ impl Table {
         self
     }
 
-    pub(crate) fn metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+    /// Returns the reporter inherited by scans of this table instance.
+    ///
+    /// Pass it to [`TableBuilder::metrics_reporter`] to preserve reporting when rebuilding a table.
+    pub fn metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
         self.metrics_reporter.clone()
     }
 

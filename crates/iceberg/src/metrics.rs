@@ -44,19 +44,31 @@ pub trait MetricsReporter: Debug + Send + Sync {
 }
 
 /// A metrics report for an Iceberg table operation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum MetricsReport {
     /// A report produced by planning a table scan.
     Scan(ScanReport),
 }
 
+impl MetricsReport {
+    /// Attaches metadata to this report, replacing an existing value with the same key.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Scan(report) => {
+                report.metadata.insert(key.into(), value.into());
+            }
+        }
+        self
+    }
+}
+
 /// Information and metrics collected while planning a table scan.
 ///
 /// Projection lists selected source fields and requested metadata columns without expanding
 /// nested types or adding fields referenced only by filters.
-#[derive(Debug)]
-#[cfg_attr(test, derive(Clone, PartialEq))]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ScanReport {
     pub(crate) table_ident: TableIdent,
     pub(crate) snapshot_id: i64,
@@ -111,8 +123,8 @@ impl ScanReport {
 }
 
 /// Metrics collected while planning a table scan.
-#[derive(Debug)]
-#[cfg_attr(test, derive(Clone, PartialEq))]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ScanMetrics {
     pub(crate) total_planning_duration: Duration,
     pub(crate) total_data_manifests: u64,

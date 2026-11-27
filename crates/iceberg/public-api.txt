@@ -1256,6 +1256,10 @@ pub fn iceberg::metadata_columns::spec_id_field() -> &'static iceberg::spec::Nes
 pub mod iceberg::metrics
 #[non_exhaustive] pub enum iceberg::metrics::MetricsReport
 pub iceberg::metrics::MetricsReport::Scan(iceberg::metrics::ScanReport)
+impl iceberg::metrics::MetricsReport
+pub fn iceberg::metrics::MetricsReport::with_metadata(self, key: impl core::convert::Into<alloc::string::String>, value: impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for iceberg::metrics::MetricsReport
+pub fn iceberg::metrics::MetricsReport::clone(&self) -> iceberg::metrics::MetricsReport
 impl core::fmt::Debug for iceberg::metrics::MetricsReport
 pub fn iceberg::metrics::MetricsReport::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::metrics::ScanMetrics
@@ -1277,6 +1281,8 @@ pub fn iceberg::metrics::ScanMetrics::total_delete_file_size_in_bytes(&self) -> 
 pub fn iceberg::metrics::ScanMetrics::total_delete_manifests(&self) -> u64
 pub fn iceberg::metrics::ScanMetrics::total_file_size_in_bytes(&self) -> u64
 pub fn iceberg::metrics::ScanMetrics::total_planning_duration(&self) -> core::time::Duration
+impl core::clone::Clone for iceberg::metrics::ScanMetrics
+pub fn iceberg::metrics::ScanMetrics::clone(&self) -> iceberg::metrics::ScanMetrics
 impl core::fmt::Debug for iceberg::metrics::ScanMetrics
 pub fn iceberg::metrics::ScanMetrics::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::metrics::ScanReport
@@ -1289,6 +1295,8 @@ pub fn iceberg::metrics::ScanReport::projected_field_names(&self) -> &[alloc::st
 pub fn iceberg::metrics::ScanReport::schema_id(&self) -> iceberg::spec::SchemaId
 pub fn iceberg::metrics::ScanReport::snapshot_id(&self) -> i64
 pub fn iceberg::metrics::ScanReport::table_ident(&self) -> &iceberg::TableIdent
+impl core::clone::Clone for iceberg::metrics::ScanReport
+pub fn iceberg::metrics::ScanReport::clone(&self) -> iceberg::metrics::ScanReport
 impl core::fmt::Debug for iceberg::metrics::ScanReport
 pub fn iceberg::metrics::ScanReport::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub trait iceberg::metrics::MetricsReporter: core::fmt::Debug + core::marker::Send + core::marker::Sync
@@ -3484,6 +3492,7 @@ pub fn iceberg::table::Table::metadata(&self) -> &iceberg::spec::TableMetadata
 pub fn iceberg::table::Table::metadata_location(&self) -> core::option::Option<&str>
 pub fn iceberg::table::Table::metadata_location_result(&self) -> iceberg::Result<&str>
 pub fn iceberg::table::Table::metadata_ref(&self) -> iceberg::spec::TableMetadataRef
+pub fn iceberg::table::Table::metrics_reporter(&self) -> core::option::Option<alloc::sync::Arc<dyn iceberg::metrics::MetricsReporter>>
 pub fn iceberg::table::Table::reader_builder(&self) -> iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::table::Table::readonly(&self) -> bool
 pub fn iceberg::table::Table::scan(&self) -> iceberg::scan::TableScanBuilder<'_>
