@@ -21,11 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iceberg::TableIdent;
-use iceberg::expr::{Predicate, PredicateOperator};
+use iceberg::expr::PredicateOperator;
 use iceberg::metrics::{MetricsReport, MetricsReporter, ScanMetrics, ScanReport};
-use iceberg::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, SchemaId, Type};
+use iceberg::spec::SchemaId;
 use reqwest::{Method, StatusCode};
-use serde::ser::{Error, SerializeStruct};
+use serde::ser::Error;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
@@ -63,16 +63,13 @@ impl MetricsReporter for RestMetricsReporter {
             tracing::warn!("Ignoring REST metrics report for a different table");
             return;
         }
-        let mut request = ReportMetricsRequest::from(report);
-        if let Some(predicate) = report.filter() {
-            match redact_predicate(predicate, chrono::Utc::now()) {
-                Ok(filter) => request.filter = Some(ReportFilter::Sanitized(filter)),
-                Err(error) => {
-                    tracing::warn!(kind = ?error.kind(), "REST metrics filter sanitization failed");
-                    return;
-                }
+        let request = match ReportMetricsRequest::try_from(report) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "REST metrics report construction failed");
+                return;
             }
-        }
+        };
         self.submit(&request).await;
     }
 }
@@ -121,23 +118,10 @@ impl RestMetricsReporter {
     }
 }
 
-#[derive(Debug)]
-enum ReportFilter {
-    Raw(Predicate),
-    Sanitized(Value),
-}
-
-impl From<Predicate> for ReportFilter {
-    fn from(predicate: Predicate) -> Self {
-        Self::Raw(predicate)
-    }
-}
-
 /// A metrics report request for the Iceberg REST catalog.
 ///
-/// Filter literals are serialized as supplied. Metrics outside the signed 64-bit range
-/// (nanoseconds for planning duration), non-finite literals, and temporal literals outside
-/// the supported date/time range return serialization errors.
+/// Filter literals are sanitized during construction. Metrics outside the signed 64-bit
+/// range (nanoseconds for planning duration) return serialization errors.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct ReportMetricsRequest {
@@ -145,8 +129,7 @@ pub(crate) struct ReportMetricsRequest {
     table_name: String,
     snapshot_id: i64,
     schema_id: SchemaId,
-    #[serde(serialize_with = "filter")]
-    filter: Option<ReportFilter>,
+    filter: Value,
     projected_field_names: Vec<String>,
     projected_field_ids: Vec<i32>,
     metrics: ScanMetricsResult,
@@ -154,19 +137,27 @@ pub(crate) struct ReportMetricsRequest {
     metadata: HashMap<String, String>,
 }
 
-impl From<&ScanReport> for ReportMetricsRequest {
-    fn from(report: &ScanReport) -> Self {
-        Self {
+impl TryFrom<&ScanReport> for ReportMetricsRequest {
+    type Error = iceberg::Error;
+
+    fn try_from(report: &ScanReport) -> iceberg::Result<Self> {
+        let now = chrono::Utc::now();
+        let filter = report
+            .filter()
+            .map(|predicate| redact_predicate(predicate, now))
+            .transpose()?
+            .unwrap_or(Value::Bool(true));
+        Ok(Self {
             report_type: "scan-report",
             table_name: report.table_ident().to_string(),
             snapshot_id: report.snapshot_id(),
             schema_id: report.schema_id(),
-            filter: report.filter().cloned().map(ReportFilter::Raw),
+            filter,
             projected_field_names: report.projected_field_names().to_vec(),
             projected_field_ids: report.projected_field_ids().to_vec(),
             metrics: report.metrics().into(),
             metadata: report.metadata().clone(),
-        }
+        })
     }
 }
 
@@ -233,14 +224,6 @@ impl From<&ScanMetrics> for ScanMetricsResult {
     }
 }
 
-fn filter<S: Serializer>(filter: &Option<ReportFilter>, serializer: S) -> Result<S::Ok, S::Error> {
-    match filter {
-        Some(ReportFilter::Raw(predicate)) => RestPredicate(predicate).serialize(serializer),
-        Some(ReportFilter::Sanitized(value)) => value.serialize(serializer),
-        None => serializer.serialize_bool(true),
-    }
-}
-
 fn count<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
     counter("count", *value, serializer)
 }
@@ -284,101 +267,6 @@ struct TimerResult {
     total_duration: i64,
 }
 
-struct RestPredicate<'a>(&'a Predicate);
-
-// The term/value form is accepted by the REST spec and matches Java's ExpressionParser.
-// https://github.com/apache/iceberg/blob/c44bd8e7c183cf92339939f2aff5ca2aa2a0fd3d/open-api/rest-catalog-open-api.yaml
-impl Serialize for RestPredicate<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0 {
-            Predicate::AlwaysTrue => serializer.serialize_bool(true),
-            Predicate::AlwaysFalse => serializer.serialize_bool(false),
-            Predicate::And(expr) | Predicate::Or(expr) => {
-                let [left, right] = expr.inputs();
-                let mut state = serializer.serialize_struct("Predicate", 3)?;
-                state.serialize_field(
-                    "type",
-                    if matches!(self.0, Predicate::And(_)) {
-                        "and"
-                    } else {
-                        "or"
-                    },
-                )?;
-                state.serialize_field("left", &RestPredicate(left))?;
-                state.serialize_field("right", &RestPredicate(right))?;
-                state.end()
-            }
-            Predicate::Not(expr) => {
-                let mut state = serializer.serialize_struct("Predicate", 2)?;
-                state.serialize_field("type", "not")?;
-                state.serialize_field("child", &RestPredicate(expr.inputs()[0]))?;
-                state.end()
-            }
-            Predicate::Unary(expr) => {
-                let mut state = serializer.serialize_struct("Predicate", 2)?;
-                state.serialize_field("type", operator(expr.op()).map_err(S::Error::custom)?)?;
-                state.serialize_field("term", expr.term().name())?;
-                state.end()
-            }
-            Predicate::Binary(expr) => {
-                let mut state = serializer.serialize_struct("Predicate", 3)?;
-                state.serialize_field("type", operator(expr.op()).map_err(S::Error::custom)?)?;
-                state.serialize_field("term", expr.term().name())?;
-                state.serialize_field(
-                    "value",
-                    &literal(expr.literal()).map_err(S::Error::custom)?,
-                )?;
-                state.end()
-            }
-            Predicate::Set(expr) => {
-                let mut values = expr
-                    .literals()
-                    .iter()
-                    .map(literal)
-                    .collect::<iceberg::Result<Vec<_>>>()
-                    .map_err(S::Error::custom)?;
-                values.sort_unstable_by_key(Value::to_string);
-                let mut state = serializer.serialize_struct("Predicate", 3)?;
-                state.serialize_field("type", operator(expr.op()).map_err(S::Error::custom)?)?;
-                state.serialize_field("term", expr.term().name())?;
-                state.serialize_field("values", &values)?;
-                state.end()
-            }
-        }
-    }
-}
-
-fn literal(datum: &Datum) -> iceberg::Result<Value> {
-    let in_range = match (datum.data_type(), datum.literal()) {
-        (PrimitiveType::Date, PrimitiveLiteral::Int(days)) => {
-            chrono::TimeDelta::try_days(i64::from(*days))
-                .and_then(|delta| {
-                    chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.checked_add_signed(delta)
-                })
-                .is_some()
-        }
-        (PrimitiveType::Timestamp | PrimitiveType::Timestamptz, PrimitiveLiteral::Long(micros)) => {
-            chrono::DateTime::from_timestamp_micros(*micros).is_some()
-        }
-        _ => true,
-    };
-    if !in_range {
-        return Err(iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
-            "Temporal scan-report literal is outside the supported date/time range",
-        ));
-    }
-    let value = Literal::Primitive(datum.literal().clone())
-        .try_into_json(&Type::Primitive(datum.data_type().clone()))?;
-    if value.is_null() {
-        return Err(iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
-            "Non-finite scan-report literals cannot be represented in REST JSON",
-        ));
-    }
-    Ok(value)
-}
-
 fn operator(op: PredicateOperator) -> iceberg::Result<&'static str> {
     Ok(match op {
         PredicateOperator::IsNull => "is-null",
@@ -409,7 +297,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use iceberg::expr::{BinaryExpression, Reference, SetExpression, UnaryExpression};
+    use iceberg::expr::{BinaryExpression, Predicate, Reference, SetExpression, UnaryExpression};
+    use iceberg::spec::Datum;
     use serde_json::json;
 
     use super::*;
@@ -420,7 +309,7 @@ mod tests {
             table_name: "analytics.sales.orders".into(),
             snapshot_id: -12345,
             schema_id: 7,
-            filter: None,
+            filter: json!(true),
             projected_field_ids: vec![1, 2, -1],
             projected_field_names: vec!["id".into(), "customer.名".into(), "_file".into()],
             metadata: HashMap::from([("query-id".into(), "query-123".into())]),
@@ -538,7 +427,7 @@ mod tests {
         report.projected_field_ids.clear();
         report.projected_field_names.clear();
         report.metadata.clear();
-        report.filter = Some(Predicate::AlwaysFalse.into());
+        report.filter = json!(false);
         let mut expected: Value =
             serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
         expected.as_object_mut().unwrap().remove("metadata");
@@ -551,16 +440,12 @@ mod tests {
     #[test]
     fn test_scan_report_nested_filter() {
         let mut report = scan_report();
-        report.filter = Some(
-            Reference::new("a")
-                .is_null()
-                .and(
-                    Reference::new("b")
-                        .equal_to(Datum::int(10))
-                        .or(!Reference::new("c").is_nan()),
-                )
-                .into(),
+        let predicate = Reference::new("a").is_null().and(
+            Reference::new("b")
+                .equal_to(Datum::int(10))
+                .or(!Reference::new("c").is_nan()),
         );
+        report.filter = redact_predicate(&predicate, chrono::Utc::now()).unwrap();
         let mut expected: Value =
             serde_json::from_str(include_str!("../testdata/metrics/scan-report.json")).unwrap();
         expected["filter"] = json!({
@@ -568,7 +453,7 @@ mod tests {
             "left": {"type": "is-null", "term": "a"},
             "right": {
                 "type": "or",
-                "left": {"type": "eq", "term": "b", "value": 10},
+                "left": {"type": "eq", "term": "b", "value": "(2-digit-int)"},
                 "right": {"type": "not", "child": {"type": "is-nan", "term": "c"}}
             }
         });
@@ -576,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_predicate_operators() {
+    fn test_sanitized_predicate_operators() {
         for (op, name) in [
             (PredicateOperator::IsNull, "is-null"),
             (PredicateOperator::NotNull, "not-null"),
@@ -585,7 +470,7 @@ mod tests {
         ] {
             let predicate = Predicate::Unary(UnaryExpression::new(op, Reference::new("a.b")));
             assert_eq!(
-                serde_json::to_value(RestPredicate(&predicate)).unwrap(),
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
                 json!({"type": name, "term": "a.b"})
             );
         }
@@ -602,11 +487,11 @@ mod tests {
             let predicate = Predicate::Binary(BinaryExpression::new(
                 op,
                 Reference::new("a"),
-                Datum::string("x"),
+                Datum::string("aaa"),
             ));
             assert_eq!(
-                serde_json::to_value(RestPredicate(&predicate)).unwrap(),
-                json!({"type": name, "term": "a", "value": "x"})
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+                json!({"type": name, "term": "a", "value": "(hash-34d05fb7)"})
             );
         }
         for (op, name) in [
@@ -616,13 +501,13 @@ mod tests {
             let predicate = Predicate::Set(SetExpression::new(
                 op,
                 Reference::new("a"),
-                [Datum::string("b"), Datum::string("a")]
+                [Datum::string("aaa"), Datum::string("test")]
                     .into_iter()
                     .collect(),
             ));
             assert_eq!(
-                serde_json::to_value(RestPredicate(&predicate)).unwrap(),
-                json!({"type": name, "term": "a", "values": ["a", "b"]})
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
+                json!({"type": name, "term": "a", "values": ["(hash-34d05fb7)", "(hash-3a6bd213)"]})
             );
         }
         for (predicate, expected) in [
@@ -630,137 +515,8 @@ mod tests {
             (Predicate::AlwaysFalse, json!(false)),
         ] {
             assert_eq!(
-                serde_json::to_value(RestPredicate(&predicate)).unwrap(),
+                redact_predicate(&predicate, chrono::Utc::now()).unwrap(),
                 expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_out_of_range_temporal_filter_literals_return_errors() {
-        let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.date_naive();
-        let min_days = chrono::NaiveDate::MIN
-            .signed_duration_since(epoch)
-            .num_days() as i32;
-        let max_days = chrono::NaiveDate::MAX
-            .signed_duration_since(epoch)
-            .num_days() as i32;
-        let min_micros = chrono::DateTime::<chrono::Utc>::MIN_UTC.timestamp_micros();
-        let max_micros = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_micros();
-        let mut invalid = vec![
-            Datum::date(i32::MIN),
-            Datum::date(i32::MAX),
-            Datum::date(min_days - 1),
-            Datum::date(max_days + 1),
-        ];
-        for micros in [i64::MIN, i64::MAX, min_micros - 1, max_micros + 1] {
-            invalid.extend([
-                Datum::timestamp_micros(micros),
-                Datum::timestamptz_micros(micros),
-            ]);
-        }
-        for datum in invalid {
-            for predicate in [
-                Reference::new("value").equal_to(datum.clone()),
-                Reference::new("value").is_in([datum.clone()]),
-            ] {
-                let mut report = scan_report();
-                report.filter = Some(predicate.into());
-                assert!(serde_json::to_value(report).is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn test_temporal_filter_literal_boundaries() {
-        let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.date_naive();
-        let mut cases = Vec::new();
-        for date in [chrono::NaiveDate::MIN, chrono::NaiveDate::MAX] {
-            cases.push((
-                Datum::date(date.signed_duration_since(epoch).num_days() as i32),
-                json!(date.to_string()),
-            ));
-        }
-        for datetime in [
-            chrono::DateTime::<chrono::Utc>::MIN_UTC,
-            chrono::DateTime::<chrono::Utc>::MAX_UTC,
-        ] {
-            let micros = datetime.timestamp_micros();
-            let datetime = chrono::DateTime::from_timestamp_micros(micros).unwrap();
-            cases.push((
-                Datum::timestamp_micros(micros),
-                json!(datetime.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
-            ));
-            cases.push((
-                Datum::timestamptz_micros(micros),
-                json!(datetime.format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string()),
-            ));
-        }
-        for nanos in [i64::MIN, i64::MAX] {
-            let datetime = chrono::DateTime::from_timestamp_nanos(nanos);
-            cases.push((
-                Datum::timestamp_nanos(nanos),
-                json!(datetime.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
-            ));
-            cases.push((
-                Datum::timestamptz_nanos(nanos),
-                json!(datetime.format("%Y-%m-%dT%H:%M:%S%.f+00:00").to_string()),
-            ));
-        }
-        for (datum, expected) in cases {
-            let predicate = Reference::new("value").equal_to(datum);
-            assert_eq!(
-                serde_json::to_value(RestPredicate(&predicate)).unwrap(),
-                json!({"type":"eq", "term":"value", "value":expected})
-            );
-        }
-    }
-
-    #[test]
-    fn test_predicate_literal_types() {
-        for (datum, expected) in [
-            (Datum::bool(true), json!(true)),
-            (Datum::int(i32::MIN), json!(i32::MIN)),
-            (Datum::long(i64::MAX), json!(i64::MAX)),
-            (Datum::float(1.5_f32), json!(1.5)),
-            (Datum::double(-2.25), json!(-2.25)),
-            (Datum::string("a\"\n名"), json!("a\"\n名")),
-            (
-                Datum::date_from_str("2026-11-24").unwrap(),
-                json!("2026-11-24"),
-            ),
-            (
-                Datum::time_from_str("12:34:56.123456").unwrap(),
-                json!("12:34:56.123456"),
-            ),
-            (
-                Datum::timestamp_from_str("2026-11-24T12:34:56.123456").unwrap(),
-                json!("2026-11-24T12:34:56.123456"),
-            ),
-            (
-                Datum::timestamptz_from_str("2026-11-24T12:34:56.123456+00:00").unwrap(),
-                json!("2026-11-24T12:34:56.123456+00:00"),
-            ),
-            (
-                Datum::timestamp_nanos(1),
-                json!("1970-01-01T00:00:00.000000001"),
-            ),
-            (
-                Datum::timestamptz_nanos(1),
-                json!("1970-01-01T00:00:00.000000001+00:00"),
-            ),
-            (
-                Datum::uuid_from_str("f79c3e09-677c-4bbd-a479-3f349cb785e7").unwrap(),
-                json!("f79c3e09-677c-4bbd-a479-3f349cb785e7"),
-            ),
-            (Datum::fixed([0, 255]), json!("00ff")),
-            (Datum::binary([0, 255]), json!("00ff")),
-            (Datum::decimal_from_str("-12.34").unwrap(), json!("-12.34")),
-        ] {
-            let predicate = Reference::new("value").equal_to(datum);
-            assert_eq!(
-                serde_json::to_value(RestPredicate(&predicate)).unwrap(),
-                json!({"type": "eq", "term": "value", "value": expected})
             );
         }
     }
@@ -795,25 +551,5 @@ mod tests {
         expected["metrics"]["result-data-files"]["value"] = json!(0);
         expected["metrics"]["total-planning-duration"]["total-duration"] = json!(0);
         assert_eq!(serde_json::to_value(report).unwrap(), expected);
-    }
-
-    #[test]
-    fn test_non_finite_filter_literals_fail_serialization() {
-        for datum in [
-            Datum::float(f32::NAN),
-            Datum::double(f64::INFINITY),
-            Datum::double(f64::NEG_INFINITY),
-        ] {
-            let mut report = scan_report();
-            report.filter = Some(Reference::new("value").equal_to(datum).into());
-            assert!(serde_json::to_value(report).is_err());
-        }
-        let mut report = scan_report();
-        report.filter = Some(
-            Reference::new("value")
-                .is_in([Datum::double(f64::NAN)])
-                .into(),
-        );
-        assert!(serde_json::to_value(report).is_err());
     }
 }
